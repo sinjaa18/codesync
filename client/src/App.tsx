@@ -22,7 +22,7 @@ export default function App(){
 
   const joinRoom=()=>{
   if(!roomId.trim())return
-  const ws = new WebSocket("ws://localhost:5000")
+  const ws = new WebSocket("wss://codesync-qngs.onrender.com/")
   wsRef.current=ws
   ws.onopen=()=>{
     ws.send(JSON.stringify({
@@ -56,7 +56,7 @@ export default function App(){
 //run code button
   const runCode=async()=>{
     try{
-      const res = await fetch("http://localhost:5000/run",{
+      const res = await fetch("https://codesync-qngs.onrender.com/run",{
         method:"POST",
         headers:{
           "Content-Type":"application/json"

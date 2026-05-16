@@ -71,7 +71,7 @@ Make sure you have [Node.js](https://nodejs.org/) (v16 or higher) and `npm` inst
 
 ### 1. Clone the repository
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/sinjaa18/codesync
 cd CodeSync
 
 ### 2. Start the Backend 
@@ -109,6 +109,6 @@ npm run dev
 
 Sintu Kumar
 📧 Email: santa143ns@gmail.com
-🐙 GitHub: @sinjaa19
+🐙 GitHub: @sinjaa18
 
 If you found this project helpful, please consider giving it a ⭐ on GitHub!
