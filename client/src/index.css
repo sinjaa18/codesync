@@ -1,0 +1,174 @@
+html,
+body,
+#root{
+  margin:0;
+  padding:0;
+  height:100%;
+  width:100%;
+  overflow:hidden;
+  font-family: Inter,sans-serif;
+}
+
+.app{
+  height:100%;
+  display:flex;
+  flex-direction:column;
+  background:#0f0f0f;
+}
+
+.topbar{
+  height:60px;
+  background:#1a1a1a;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 16px;
+  color:white;
+  border-bottom:1px solid #333;
+  font-family:sans-serif;
+}
+
+.logo{
+ display:flex;
+  gap:4px;
+  font-size:24px;
+  font-weight:bold;
+  letter-spacing:1px;
+}
+.logo-code{
+  color:#3b82f6;
+  animation:pulseBlue 3s infinite;
+}
+
+.logo-sync{
+  color:#ef4444;
+  animation:pulseRed 20s infinite;
+}
+
+@keyframes pulseBlue{
+  0%{
+    text-shadow:0 0 5px #3b82f6;
+  }
+  50%{
+    text-shadow:0 0 14px #3b82f6;
+  }
+  100%{
+    text-shadow:0 0 5px #3b82f6;
+  }
+}
+
+@keyframes pulseRed{
+  0%{
+    text-shadow:0 0 5px #ef4444;
+  }
+  50%{
+    text-shadow:0 0 14px #ef4444;
+  }
+  100%{
+    text-shadow:0 0 5px #ef4444;
+  }
+}
+
+.room{
+  color:#aaa;
+}
+
+.status{
+  color:limegreen;
+}
+
+.editor-container{
+  flex:1;
+}
+
+.remote-cursor{
+  border-left:2px solid red;
+}
+
+select{
+  background:#222;
+  color:white;
+  border:1px solid #444;
+  padding:6px 10px;
+  border-radius:6px;
+}
+
+.main-container{
+  flex:1;
+  display:flex;
+}
+
+.editor-container{
+  flex:3;
+}
+
+.output-container{
+  flex:1;
+  background:#111;
+  color:white;
+  border-left:1px solid #333;
+  padding:15px;
+  font-family:monospace;
+  overflow:auto;
+}
+
+.output-title{
+  font-size:18px;
+  margin-bottom:10px;
+  color:#aaa;
+}
+button{
+  background:#2563eb;
+  color:white;
+  border:none;
+  padding:8px 16px;
+  border-radius:6px;
+  cursor:pointer;
+  transition:0.2s;
+}
+
+button:hover{
+  opacity:0.9;
+  transform:translateY(-1px);
+}
+.leave-btn{
+  background:#dc2626;
+}
+.join-screen{
+  height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  background:#0f0f0f;
+}
+
+.join-box{
+  width:320px;
+  display:flex;
+  flex-direction:column;
+  gap:15px;
+  background:#1a1a1a;
+  padding:30px;
+  border-radius:10px;
+  box-shadow:0 0 20px rgba(0,0,0,0.4);
+}
+
+.join-box h1{
+  color:white;
+  text-align:center;
+}
+
+.join-box input{
+  padding:12px;
+  border:none;
+  outline:none;
+  background:#222;
+  color:white;
+  border-radius:6px;
+}
+input::placeholder{
+  color:#666;
+}
+pre{
+  white-space: pre-wrap;
+}
