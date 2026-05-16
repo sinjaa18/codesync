@@ -106,8 +106,8 @@ npm run dev
 
 
 👨‍💻 Author
-Sintu Kumar
 
+Sintu Kumar
 📧 Email: santa143ns@gmail.com
 🐙 GitHub: @sinjaa19
 
