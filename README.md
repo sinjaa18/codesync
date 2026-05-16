@@ -109,6 +109,6 @@ npm run dev
 
 Sintu Kumar
 📧 Email: santa143ns@gmail.com
-🐙 GitHub: @sinjaa19
+🐙 GitHub: @sinjaa18
 
 If you found this project helpful, please consider giving it a ⭐ on GitHub!
