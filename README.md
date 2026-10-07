@@ -1,93 +1,637 @@
-# CodeSync
+# ⚡ CodeSync
 
-CodeSync is a browser-based shared code editor. People in the same room edit one Monaco document and can see each other's cursor positions.
+### Real-time collaborative code editor built with React, TypeScript, Monaco Editor, WebSockets, and Judge0.
 
-## Features
+[![Live Demo](https://img.shields.io/badge/Live-Demo-success?style=flat-square)](https://codesync-nu-ashen.vercel.app/)
+[![Frontend](https://img.shields.io/badge/Frontend-Vercel-black?style=flat-square&logo=vercel)](https://vercel.com/)
+[![Backend](https://img.shields.io/badge/Backend-Render-46E3B7?style=flat-square&logo=render)](https://render.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?style=flat-square&logo=typescript)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-TypeScript-61DAFB?style=flat-square&logo=react)](https://react.dev/)
+[![WebSocket](https://img.shields.io/badge/Realtime-WebSocket-purple?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
 
-- Join a room using its ID; copy the ID to invite another person.
-- Share the latest room code and cursor positions over WebSockets.
-- Edit with Monaco syntax highlighting for JavaScript, TypeScript, Python, C++, and Java.
-- Run code through a configured Judge0 sandbox service.
-- See connection state, participant count, execution output, and request errors.
+> **Write code together. See changes instantly. Run it safely.**
 
-## Tech Stack
+CodeSync is a browser-based collaborative code editor where multiple users can join the same room, edit a shared Monaco document, see remote cursor positions, and execute code through the Judge0 sandbox API.
 
-- Frontend: React, TypeScript, Vite, Monaco Editor.
-- Backend: Node.js, TypeScript, Express, `ws`, and Zod.
-- Execution: Judge0 Community Edition API (configurable).
+---
 
-## Architecture
+## 🌐 Live Demo
+
+### 🚀 Try CodeSync
+
+**https://codesync-nu-ashen.vercel.app/**
+
+Open the application in two browser tabs, join the same room, and start editing.
+
+### 💻 Source Code
+
+**https://github.com/sinjaa18/codesync**
+
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---|---|
+| 🏠 Room-based collaboration | Join a shared workspace using a room ID |
+| ⚡ Real-time editing | Code changes are synchronized through WebSockets |
+| 🎯 Cursor sharing | Remote cursor positions are synchronized between participants |
+| 👥 Presence | Shows the number of connected participants |
+| 🧑‍💻 Monaco Editor | Full editor experience with syntax highlighting |
+| 🌐 Multi-language | JavaScript, TypeScript, Python, C++, and Java |
+| ▶️ Code execution | Execute code through Judge0 Community Edition |
+| 🔄 Reconnection handling | Detects closed connections and allows reconnecting |
+| 📋 Room sharing | Copy a room ID to invite another participant |
+| 🛡️ Server-side validation | Execution requests are validated before submission |
+| 🚫 No unsafe execution | User code is never evaluated inside the CodeSync server |
+
+---
+
+## 🖥️ Screenshots
+
+### Join a Room
+
+![CodeSync Room](screenshots/join-room.png)
+
+### Collaborative Editor
+
+![CodeSync Editor](screenshots/editor-output.png)
+
+---
+
+## 🏗️ Architecture
 
 ```text
-React + Monaco
-      │ WebSocket (room join, code, cursor)
-      ▼
-Node.js + Express + ws ── in-memory room state
-
-React ── HTTP POST /run ── Express ── Judge0 sandbox API
+                         CodeSync
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+             ▼                             ▼
+      React + Monaco                  REST API
+             │                             │
+             │ WebSocket                  │ POST /run
+             ▼                             ▼
+      Node.js + Express                Judge0 API
+             │
+             │
+             ▼
+      ws WebSocket Server
+             │
+             ▼
+      In-Memory Room State
 ```
 
-WebSockets carry collaboration events. Express keeps room membership and each active room's latest full code string in memory. The REST endpoint validates execution requests and submits them to Judge0; user code is never evaluated inside the CodeSync server process.
+### Collaboration Flow
 
-## Realtime synchronization
+```text
+User A
+  │
+  │ code-update
+  ▼
+WebSocket Server
+  │
+  ├── update room state
+  │
+  └── broadcast to other members
+              │
+              ▼
+            User B
+```
 
-The client debounces code changes by 300 ms and sends the current document as a `code-update`. The server saves it for that active room and broadcasts it to the other room members. A newly joined member receives the current code in the join acknowledgement. Cursor coordinates are broadcast to other room members. The client applies incoming code as editor state and does not send that remote update back.
+### Code Execution Flow
 
-This is a simple last-update-wins model. Concurrent edits to overlapping text can overwrite each other and are not merged. Room state is held in memory and is deleted when its last socket leaves.
+```text
+Browser
+   │
+   │ POST /run
+   ▼
+Express Server
+   │
+   │ validate request
+   ▼
+Judge0
+   │
+   │ sandboxed execution
+   ▼
+Execution Result
+   │
+   ▼
+Browser Output Panel
+```
 
-## Local setup
+---
 
-Requires Node.js 22.12 or later and npm.
+## ⚡ How Realtime Collaboration Works
 
-1. In one terminal, configure and start the backend:
+CodeSync uses a simple room-based WebSocket architecture.
 
-   ```bash
-   cd server
-   cp .env.example .env
-   npm install
-   npm run dev
-   ```
+When a user joins a room:
 
-2. In another terminal, configure and start the frontend:
+```text
+Client
+  ↓
+join(roomId)
+  ↓
+Server registers socket
+  ↓
+Current room state returned
+  ↓
+Collaborative editing begins
+```
 
-   ```bash
-   cd client
-   cp .env.example .env
-   npm install
-   npm run dev
-   ```
+When code changes:
 
-3. Open the Vite URL (normally `http://localhost:5173`) in two browser tabs and join the same room ID.
+```text
+Monaco Editor
+     ↓
+300 ms debounce
+     ↓
+code-update
+     ↓
+WebSocket server
+     ↓
+save latest room document
+     ↓
+broadcast to other users
+```
 
-On PowerShell, use `Copy-Item .env.example .env` in each directory instead of `cp` if needed.
+Cursor movement follows a similar WebSocket event flow.
 
-## Environment variables
+Remote code updates are applied to Monaco without sending the same update back to the server, preventing an unnecessary update loop.
 
-`client/.env.example` sets `VITE_API_URL` and `VITE_WS_URL`. Vite exposes these values in the browser bundle, so they must only contain public service URLs. Local defaults are also provided by the app.
+### Room State
 
-`server/.env.example` sets the backend port, allowed frontend origin, Judge0 API URL, and optional Judge0 auth token. Copy it to `server/.env` and set credentials privately when the chosen Judge0 host requires them. The server defaults to the official Judge0 CE endpoint; public service availability and rate limits are controlled by that service.
+```text
+Room ID
+   │
+   ├── connected sockets
+   └── latest code
+```
 
-## Screenshots
+When the last participant leaves, the room state is removed from memory.
 
-![CodeSync room join screen](screenshots/join-room.png)
+---
 
-![CodeSync editor and output panel](screenshots/editor-output.png)
+## 🧠 Engineering Decisions
 
-## Limitations
+### Why WebSockets?
 
-- Rooms and code exist only in server memory and are removed after the last participant disconnects or the server restarts.
-- Concurrent edits are not conflict-free; the latest received full-document update wins.
-- Cursor sharing shows one remote cursor at a time and does not sync selections or identify participants.
-- There is no authentication or authorization. Room IDs are the only room access mechanism.
-- Execution depends on an external Judge0 host. The selected service controls language versions, availability, and any additional limits. CodeSync applies basic per-process request limits and bounded source/runtime settings; a public deployment should use a configured sandbox and a shared rate limiter behind its trusted proxy.
+HTTP is useful for request/response operations such as code execution, but collaboration requires continuous bidirectional communication.
 
-## Future improvements
+CodeSync therefore uses:
 
-- Persist room state with a database and an expiry policy.
-- Add authentication and room access controls.
-- Add presence labels and per-user cursor decorations.
-- Add automated collaboration and execution tests.
+```text
+WebSocket → realtime collaboration
+HTTP      → code execution
+```
 
-## Live demo
+### Why Full-Document Synchronization?
 
-No live demo is currently configured.
+CodeSync intentionally uses a simple last-update-wins model.
+
+This keeps the system small and understandable while demonstrating the fundamentals of:
+
+- WebSocket communication
+- room membership
+- event broadcasting
+- shared state
+- remote editor updates
+- connection lifecycle management
+
+### Why Not `eval()`?
+
+Executing arbitrary user code directly inside the application server would be unsafe.
+
+Instead:
+
+```text
+CodeSync Server
+      │
+      ▼
+Judge0 Sandbox
+      │
+      ▼
+User Program
+```
+
+The CodeSync backend never evaluates submitted source code itself.
+
+---
+
+## ▶️ Supported Languages
+
+```text
+JavaScript
+TypeScript
+Python
+C++
+Java
+```
+
+Code execution is handled by the configured Judge0 Community Edition service.
+
+The exact compiler/runtime version and public availability depend on the selected Judge0 host.
+
+---
+
+## 🔐 Security Considerations
+
+CodeSync is designed as a learning and portfolio-scale collaborative editor rather than a production-grade multi-tenant IDE.
+
+Current protections include:
+
+- Zod request validation
+- server-side execution request validation
+- external sandbox execution through Judge0
+- bounded source/runtime settings
+- configurable allowed frontend origin
+- no direct server-side `eval()` or dynamic execution
+
+### Important
+
+The public deployment does **not** provide authentication or room-level authorization.
+
+Room IDs are currently the access mechanism.
+
+A production-grade version could add:
+
+```text
+Authentication
+      ↓
+Authorized room membership
+      ↓
+Persistent storage
+      ↓
+Distributed rate limiting
+      ↓
+Stronger execution isolation
+```
+
+---
+
+## 🧪 Verification
+
+The project was tested locally and against the deployed production services.
+
+Verified functionality includes:
+
+- frontend production build
+- backend TypeScript build
+- WebSocket connection establishment
+- room joining
+- participant counts
+- realtime code synchronization
+- cursor synchronization
+- room isolation
+- late-join code snapshots
+- malformed and invalid room messages
+- disconnect cleanup
+- Judge0 code execution
+- production `/run` API
+- production frontend/backend communication
+- dependency security audit
+
+The production frontend is deployed on Vercel and the backend on Render.
+
+---
+
+## 🛠️ Tech Stack
+
+### Frontend
+
+- React
+- TypeScript
+- Vite
+- Monaco Editor
+
+### Backend
+
+- Node.js
+- TypeScript
+- Express
+- `ws`
+- Zod
+
+### Code Execution
+
+- Judge0 Community Edition API
+
+### Deployment
+
+- Vercel
+- Render
+
+---
+
+## 📁 Project Structure
+
+```text
+CodeSync/
+│
+├── client/
+│   ├── src/
+│   │   ├── App.tsx
+│   │   ├── main.tsx
+│   │   └── ...
+│   ├── .env.example
+│   ├── package.json
+│   └── vite.config.ts
+│
+├── server/
+│   ├── src/
+│   │   └── index.ts
+│   ├── .env.example
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── screenshots/
+│   ├── join-room.png
+│   └── editor-output.png
+│
+├── .gitignore
+└── README.md
+```
+
+---
+
+## 🚀 Local Development
+
+### Prerequisites
+
+- Node.js 22.12+
+- npm
+
+### 1. Clone
+
+```bash
+git clone https://github.com/sinjaa18/codesync.git
+cd codesync
+```
+
+### 2. Start the Backend
+
+```bash
+cd server
+npm install
+cp .env.example .env
+npm run dev
+```
+
+On PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+### 3. Start the Frontend
+
+Open another terminal:
+
+```bash
+cd client
+npm install
+cp .env.example .env
+npm run dev
+```
+
+On PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Open:
+
+```text
+http://localhost:5173
+```
+
+Open the application in two browser tabs and join the same room.
+
+---
+
+## ⚙️ Environment Variables
+
+### Client
+
+`client/.env.example`
+
+```env
+VITE_API_URL=http://localhost:5000
+VITE_WS_URL=ws://localhost:5000
+```
+
+Production values:
+
+```env
+VITE_API_URL=https://codesync-7qiq.onrender.com
+VITE_WS_URL=wss://codesync-7qiq.onrender.com
+```
+
+These values are exposed to the browser and should therefore contain only public service URLs.
+
+### Server
+
+`server/.env.example`
+
+```env
+PORT=5000
+CLIENT_ORIGIN=http://localhost:5173
+JUDGE0_API_URL=https://ce.judge0.com
+JUDGE0_AUTH_TOKEN=
+```
+
+The Judge0 token is optional and depends on the configured Judge0 provider.
+
+Never commit real secrets.
+
+---
+
+## 📡 API
+
+### Health Check
+
+```http
+GET /
+```
+
+Response:
+
+```text
+CodeSync server is running.
+```
+
+### Execute Code
+
+```http
+POST /run
+```
+
+Example request:
+
+```json
+{
+  "language": "javascript",
+  "code": "console.log('Hello CodeSync')"
+}
+```
+
+The server validates the request and submits it to Judge0.
+
+---
+
+## 🔌 WebSocket Events
+
+The collaboration protocol uses a small set of events:
+
+```text
+join
+code-update
+cursor-update
+users
+user-left
+```
+
+The server also sends the latest room document to newly joined users so they can immediately synchronize with the existing session.
+
+---
+
+## ⚠️ Current Limitations
+
+CodeSync intentionally keeps the architecture simple.
+
+### Collaboration
+
+The current synchronization model is:
+
+```text
+last received full-document update wins
+```
+
+Therefore, simultaneous edits to overlapping text can overwrite each other.
+
+### Persistence
+
+Room state exists only in server memory.
+
+A server restart removes active rooms and their code.
+
+### Authentication
+
+There is currently no authentication or authorization system.
+
+### Scaling
+
+The current room state is process-local and designed for a single server instance.
+
+### Presence
+
+Only participant count and a single remote cursor are currently represented.
+
+### Execution
+
+Code execution depends on the configured external Judge0 service and its availability and rate limits.
+
+---
+
+## 🗺️ Future Improvements
+
+```text
+Current
+  │
+  ├── In-memory rooms
+  ├── Last-write-wins synchronization
+  ├── No authentication
+  └── Single server instance
+        │
+        ▼
+Next
+  │
+  ├── Authentication
+  ├── Persistent rooms
+  ├── Per-user cursor presence
+  ├── Better conflict handling
+  └── Rate limiting
+        │
+        ▼
+Future
+  │
+  ├── Conflict-free collaboration
+  ├── Redis-based distributed presence
+  ├── Multi-instance WebSocket scaling
+  ├── Persistent project/workspace storage
+  └── Collaborative project management
+```
+
+---
+
+## 💡 What This Project Demonstrates
+
+CodeSync demonstrates practical understanding of:
+
+- WebSocket communication
+- event-driven server architecture
+- realtime state synchronization
+- connection lifecycle management
+- room-based session management
+- Monaco Editor integration
+- REST + WebSocket architecture
+- API validation with Zod
+- external sandboxed code execution
+- frontend/backend deployment
+- production environment configuration
+- debugging and production verification
+
+---
+
+## 🎯 Demo Scenario
+
+```text
+1. Open CodeSync
+        ↓
+2. Join a room
+        ↓
+3. Open the same room in another tab
+        ↓
+4. Start typing
+        ↓
+5. Watch changes synchronize
+        ↓
+6. Move the cursor
+        ↓
+7. Observe participant presence
+        ↓
+8. Run the code
+        ↓
+9. View execution output
+```
+
+---
+
+## 📌 Project Status
+
+**Status: Deployed and functional**
+
+| Component | Platform |
+|---|---|
+| Frontend | Vercel |
+| Backend | Render |
+| Realtime Transport | WebSocket |
+| Code Execution | Judge0 Community Edition |
+
+---
+
+## 👨‍💻 Author
+
+**Sintu Kumar**
+
+B.Tech CSE — NIT Agartala
+
+GitHub:  
+https://github.com/sinjaa18
+
+---
+
+## 📄 License
+
+This project is a personal learning and portfolio project.
