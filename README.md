@@ -1,114 +1,93 @@
-# ⚡ CodeSync
+# CodeSync
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat&logo=typescript&logoColor=white)]()
-[![React](https://img.shields.io/badge/React-20232A?style=flat&logo=react&logoColor=61DAFB)]()
+CodeSync is a browser-based shared code editor. People in the same room edit one Monaco document and can see each other's cursor positions.
 
-A high-performance, real-time collaborative code editor built with React, TypeScript, WebSockets, and the Monaco Editor. 
+## Features
 
----
+- Join a room using its ID; copy the ID to invite another person.
+- Share the latest room code and cursor positions over WebSockets.
+- Edit with Monaco syntax highlighting for JavaScript, TypeScript, Python, C++, and Java.
+- Run code through a configured Judge0 sandbox service.
+- See connection state, participant count, execution output, and request errors.
 
-## 📑 Table of Contents
-- [Features](#-features)
-- [Tech Stack](#-tech-stack)
-- [Architecture](#-architecture)
-- [Screenshots](#-screenshots)
-- [Getting Started](#-getting-started)
-- [Future Roadmap](#-future-roadmap)
-- [Author](#-author)
+## Tech Stack
 
----
+- Frontend: React, TypeScript, Vite, Monaco Editor.
+- Backend: Node.js, TypeScript, Express, `ws`, and Zod.
+- Execution: Judge0 Community Edition API (configurable).
 
-## ✨ Features
+## Architecture
 
-### 🤝 Collaboration
-- **Real-time Syncing:** Instantaneous code updates across all connected clients.
-- **Room-Based Sessions:** Isolated workspaces for different teams or projects.
-- **Live Cursors:** Visual indicators showing where other users are currently typing.
-- **Session Management:** Easily join, leave, and copy room IDs for quick sharing.
-- **Room Persistence:** Code state remains intact even if users temporarily disconnect.
+```text
+React + Monaco
+      │ WebSocket (room join, code, cursor)
+      ▼
+Node.js + Express + ws ── in-memory room state
 
-### 💻 Editor Experience
-- **Monaco Engine:** Powered by the same robust editor engine used in VS Code.
-- **Multi-Language Support:** Syntax highlighting and formatting for various programming languages.
-- **Code Execution:** Run code directly within the browser environment.
+React ── HTTP POST /run ── Express ── Judge0 sandbox API
+```
 
----
+WebSockets carry collaboration events. Express keeps room membership and each active room's latest full code string in memory. The REST endpoint validates execution requests and submits them to Judge0; user code is never evaluated inside the CodeSync server process.
 
-## 🛠️ Tech Stack
+## Realtime synchronization
 
-**Frontend:**
-- [React](https://reactjs.org/) - UI Framework
-- [TypeScript](https://www.typescriptlang.org/) - Type Safety
-- [Monaco Editor](https://microsoft.github.io/monaco-editor/) - Core editing experience
+The client debounces code changes by 300 ms and sends the current document as a `code-update`. The server saves it for that active room and broadcasts it to the other room members. A newly joined member receives the current code in the join acknowledgement. Cursor coordinates are broadcast to other room members. The client applies incoming code as editor state and does not send that remote update back.
 
-**Backend:**
-- [Node.js](https://nodejs.org/) & [Express](https://expressjs.com/) - Server environment and REST API
-- [WebSocket (`ws`)](https://github.com/websockets/ws) - Bi-directional real-time communication
-- [Zod](https://zod.dev/) - Schema validation
+This is a simple last-update-wins model. Concurrent edits to overlapping text can overwrite each other and are not merged. Room state is held in memory and is deleted when its last socket leaves.
 
----
+## Local setup
 
-## 🏗️ Architecture
+Requires Node.js 22.12 or later and npm.
 
-CodeSync utilizes a hybrid communication approach to ensure low latency and reliability:
+1. In one terminal, configure and start the backend:
 
-- **WebSockets (State & Sync):** Handles the real-time collaboration layer. Each room independently maintains its connected users, shared code state, and live cursor coordinates.
-- **REST API (Execution):** Handles isolated code execution requests.
+   ```bash
+   cd server
+   cp .env.example .env
+   npm install
+   npm run dev
+   ```
 
----
+2. In another terminal, configure and start the frontend:
 
-## 📸 Screenshots
-![join room](<Screenshot 2026-05-17 010612-1.png>)
-![editor & output](<Screenshot 2026-05-17 013409.png>)
+   ```bash
+   cd client
+   cp .env.example .env
+   npm install
+   npm run dev
+   ```
 
----
+3. Open the Vite URL (normally `http://localhost:5173`) in two browser tabs and join the same room ID.
 
-## 🚀 Getting Started
+On PowerShell, use `Copy-Item .env.example .env` in each directory instead of `cp` if needed.
 
-### Prerequisites
-Make sure you have [Node.js](https://nodejs.org/) (v16 or higher) and `npm` installed on your machine.
+## Environment variables
 
-### 1. Clone the repository
-```bash
-git clone https://github.com/sinjaa18/codesync
-cd CodeSync
+`client/.env.example` sets `VITE_API_URL` and `VITE_WS_URL`. Vite exposes these values in the browser bundle, so they must only contain public service URLs. Local defaults are also provided by the app.
 
-### 2. Start the Backend 
-```bash
-cd server
-npm install
-npm run dev
+`server/.env.example` sets the backend port, allowed frontend origin, Judge0 API URL, and optional Judge0 auth token. Copy it to `server/.env` and set credentials privately when the chosen Judge0 host requires them. The server defaults to the official Judge0 CE endpoint; public service availability and rate limits are controlled by that service.
 
-2. Start the Backend
-``bash
+## Screenshots
 
-cd server
-npm install
-npm run dev
-(The server will typically run on http://localhost:5000 or your configured PORT)
+![CodeSync room join screen](screenshots/join-room.png)
 
-3. Start the Frontend
-Open a new terminal window:
+![CodeSync editor and output panel](screenshots/editor-output.png)
 
-``bash
-cd client
-npm install
-npm run dev
+## Limitations
 
+- Rooms and code exist only in server memory and are removed after the last participant disconnects or the server restarts.
+- Concurrent edits are not conflict-free; the latest received full-document update wins.
+- Cursor sharing shows one remote cursor at a time and does not sync selections or identify participants.
+- There is no authentication or authorization. Room IDs are the only room access mechanism.
+- Execution depends on an external Judge0 host. The selected service controls language versions, availability, and any additional limits. CodeSync applies basic per-process request limits and bounded source/runtime settings; a public deployment should use a configured sandbox and a shared rate limiter behind its trusted proxy.
 
-🗺️ Future Roadmap
-[ ] Better Execution Sandbox: Implementing Docker or secure VMs for safer code execution.
-[ ] Database Persistence: Saving room states permanently using a database like MongoDB.
-[ ] Authentication: User accounts, login, and saved project dashboards.
-[ ] Multi-cursor Support: Enhanced text-selection syncing across users.
-[ ] Real Deployment: Hosting the backend on a cloud provider and frontend on Vercel/Netlify.
+## Future improvements
 
+- Persist room state with a database and an expiry policy.
+- Add authentication and room access controls.
+- Add presence labels and per-user cursor decorations.
+- Add automated collaboration and execution tests.
 
-👨‍💻 Author
+## Live demo
 
-Sintu Kumar
-📧 Email: santa143ns@gmail.com
-🐙 GitHub: @sinjaa18
-
-If you found this project helpful, please consider giving it a ⭐ on GitHub!
+No live demo is currently configured.

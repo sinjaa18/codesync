@@ -1,136 +1,99 @@
 import express from "express"
 import cors from "cors"
 import { createServer } from "node:http"
-import { WebSocketServer,WebSocket,type RawData } from "ws"
-
+import { WebSocketServer, WebSocket, type RawData } from "ws"
+import { z } from "zod"
 import executionRoutes from "./routes/execution.route.js"
 import type { WSMessage } from "./types/ws.types.js"
 
 const app = express()
-const PORT = 5000
-
+const port = Number(process.env.PORT) || 5000
 const server = createServer(app)
+const wss = new WebSocketServer({ server, maxPayload: 1_000_000 })
+const rooms = new Map<string, Set<WebSocket>>()
+const membership = new Map<WebSocket, { roomId: string; userId: string }>()
+const roomCode = new Map<string, string>()
+const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()) ?? ["http://localhost:5173"]
 
-const wss = new WebSocketServer({ server })
+const messageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("join"), roomId: z.string().trim().min(1).max(64), userId: z.string().min(1).max(64) }),
+  z.object({ type: z.literal("code-update"), roomId: z.string().min(1).max(64), userId: z.string().min(1).max(64), changes: z.string().max(500_000) }),
+  z.object({ type: z.literal("cursor-update"), roomId: z.string().min(1).max(64), userId: z.string().min(1).max(64), line: z.number().int().min(1), column: z.number().int().min(1) }),
+])
 
-const rooms = new Map<string,Set<WebSocket>>()
-const clientRoom = new Map<WebSocket,string>()
-const roomCode = new Map<string,string>()
+function send(ws: WebSocket, message: object) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message))
+}
 
-wss.on("connection",(ws:WebSocket)=>{
+function broadcast(roomId: string, message: object, sender?: WebSocket) {
+  for (const client of rooms.get(roomId) ?? []) {
+    if (client !== sender) send(client, message)
+  }
+}
 
-  console.log("Client connected")
+function leaveRoom(ws: WebSocket) {
+  const member = membership.get(ws)
+  if (!member) return
+  const room = rooms.get(member.roomId)
+  room?.delete(ws)
+  membership.delete(ws)
+  if (!room?.size) {
+    rooms.delete(member.roomId)
+    roomCode.delete(member.roomId)
+  } else {
+    broadcast(member.roomId, { type: "user-left", userId: member.userId })
+    broadcast(member.roomId, { type: "users", count: room.size })
+  }
+}
 
-  ws.on("message",(data:RawData)=>{
-
-    const text = data.toString()
-
-    let parsed:WSMessage
-
-    try{
-      parsed = JSON.parse(text)
-    }catch{
-      console.log("Invalid JSON")
+wss.on("connection", (ws, request) => {
+  const origin = request.headers.origin
+  if (origin && !allowedOrigins.includes(origin)) {
+    ws.close(1008, "Origin not allowed")
+    return
+  }
+  ws.on("message", (raw: RawData) => {
+    let value: unknown
+    try {
+      value = JSON.parse(raw.toString())
+    } catch {
+      send(ws, { type: "error", message: "Message must be valid JSON." })
+      return
+    }
+    const result = messageSchema.safeParse(value)
+    if (!result.success) {
+      send(ws, { type: "error", message: "Invalid message." })
+      return
+    }
+    const message: WSMessage = result.data
+    if (message.type === "join") {
+      leaveRoom(ws)
+      const roomId = message.roomId.trim()
+      const room = rooms.get(roomId) ?? new Set<WebSocket>()
+      room.add(ws)
+      rooms.set(roomId, room)
+      membership.set(ws, { roomId, userId: message.userId })
+      send(ws, { type: "joined", roomId, code: roomCode.get(roomId) ?? "", count: room.size })
+      broadcast(roomId, { type: "users", count: room.size }, ws)
       return
     }
 
-    if(parsed.type==="join"){
-
-      const { roomId } = parsed
-
-      if(!rooms.has(roomId)){
-        rooms.set(roomId,new Set())
-      }
-
-      rooms.get(roomId)?.add(ws)
-
-      clientRoom.set(ws,roomId)
-
-      const savedCode = roomCode.get(roomId)
-
-      if(savedCode){
-
-        ws.send(JSON.stringify({
-          type:"code-update",
-          changes:savedCode,
-          userId:"server"
-        }))
-      }
-
-      console.log(`Client joined room ${roomId}`)
-
-      return
-    }
-
-    if(parsed.type==="code-update"){
-
-      const roomId = clientRoom.get(ws)
-
-      if(!roomId)return
-
-      roomCode.set(roomId,parsed.changes)
-
-      const room = rooms.get(roomId)
-
-      if(!room)return
-
-      room.forEach((client)=>{
-
-        if(client!==ws && client.readyState===WebSocket.OPEN){
-
-          client.send(JSON.stringify(parsed))
-        }
-      })
-
-      return
-    }
-
-    if(parsed.type==="cursor-update"){
-
-      const roomId = clientRoom.get(ws)
-
-      if(!roomId)return
-
-      const room = rooms.get(roomId)
-
-      if(!room)return
-
-      room.forEach((client)=>{
-
-        if(client!==ws && client.readyState===WebSocket.OPEN){
-
-          client.send(JSON.stringify(parsed))
-        }
-      })
-
-      return
+    const member = membership.get(ws)
+    if (!member || message.roomId !== member.roomId || message.userId !== member.userId) return
+    if (message.type === "code-update") {
+      roomCode.set(member.roomId, message.changes)
+      broadcast(member.roomId, message, ws)
+    } else {
+      broadcast(member.roomId, message, ws)
     }
   })
-
-  ws.on("close",()=>{
-
-    const roomId = clientRoom.get(ws)
-
-    if(roomId){
-
-      rooms.get(roomId)?.delete(ws)
-
-      clientRoom.delete(ws)
-    }
-
-    console.log("Client disconnected")
-  })
+  ws.on("close", () => leaveRoom(ws))
+  ws.on("error", () => leaveRoom(ws))
 })
 
-app.use(cors())
-app.use(express.json())
+app.use(cors({ origin: allowedOrigins }))
+app.use(express.json({ limit: "32kb" }))
+app.use("/", executionRoutes)
+app.get("/", (_req, res) => res.send("CodeSync server is running."))
 
-app.use("/",executionRoutes)
-
-app.get("/",(_,res)=>{
-  res.send("Server Running")
-})
-
-server.listen(PORT,()=>{
-  console.log(`Server running on port ${PORT}`)
-})
+server.listen(port, () => console.log(`CodeSync server listening on port ${port}`))
