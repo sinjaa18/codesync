@@ -4,6 +4,7 @@ import type { ZodTypeAny } from "zod"
 
 import { codeSchema } from "../validators/execution.validator.js"
 import { runCode } from "../controllers/execution.controller.js"
+import { requireAuth } from "../auth/middleware.js"
 
 const router = Router()
 const requests = new Map<string, { count: number; resetAt: number }>()
@@ -45,6 +46,6 @@ const validate=
   next()
 }
 
-router.post("/run", validate(codeSchema), limitExecution, runCode)
+router.post("/run", requireAuth, validate(codeSchema), limitExecution, runCode)
 
 export default router

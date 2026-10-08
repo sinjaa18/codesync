@@ -1,7 +1,11 @@
+export type AuthenticateMessage={
+  type:"authenticate"
+  token:string
+}
+
 export type JoinMessage={
   type:"join"
   roomId:string
-  userId:string
   stateVector?:string
 }
 
@@ -9,7 +13,6 @@ export type DocumentUpdateMessage={
   type:"doc-update"
   roomId:string
   update:string
-  userId:string
 }
 
 export type CursorUpdateMessage={
@@ -17,10 +20,10 @@ export type CursorUpdateMessage={
   roomId:string
   line:number
   column:number
-  userId:string
 }
 
 export type WSMessage=
+| AuthenticateMessage
 | JoinMessage
 | DocumentUpdateMessage
 | CursorUpdateMessage

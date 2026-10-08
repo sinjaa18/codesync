@@ -5,7 +5,11 @@ import { WebSocketServer, WebSocket, type RawData } from "ws"
 import { z } from "zod"
 import * as Y from "yjs"
 import executionRoutes from "./routes/execution.route.js"
+import authRoutes from "./routes/auth.route.js"
+import roomRoutes from "./routes/room.route.js"
 import type { WSMessage } from "./types/ws.types.js"
+import { getSession, getSessionByKey, onSessionRevoked } from "./auth/store.js"
+import { hasRoomAccess } from "./auth/roomStore.js"
 
 const app = express()
 const port = Number(process.env.PORT) || 5000
@@ -13,13 +17,16 @@ const server = createServer(app)
 const wss = new WebSocketServer({ server, maxPayload: 1_000_000 })
 const rooms = new Map<string, Set<WebSocket>>()
 const membership = new Map<WebSocket, { roomId: string; userId: string }>()
+const socketSessions = new Map<WebSocket, string>()
+const socketExpiryTimers = new Map<WebSocket, NodeJS.Timeout>()
 const roomDocs = new Map<string, Y.Doc>()
 const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()) ?? ["http://localhost:5173"]
 
 const messageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("join"), roomId: z.string().trim().min(1).max(64), userId: z.string().min(1).max(64), stateVector: z.string().max(20_000).optional() }),
-  z.object({ type: z.literal("doc-update"), roomId: z.string().min(1).max(64), userId: z.string().min(1).max(64), update: z.string().min(4).max(750_000) }),
-  z.object({ type: z.literal("cursor-update"), roomId: z.string().min(1).max(64), userId: z.string().min(1).max(64), line: z.number().int().min(1), column: z.number().int().min(1) }),
+  z.object({ type: z.literal("authenticate"), token: z.string().min(40).max(60) }),
+  z.object({ type: z.literal("join"), roomId: z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/), stateVector: z.string().max(20_000).optional() }),
+  z.object({ type: z.literal("doc-update"), roomId: z.string().min(1).max(64), update: z.string().min(4).max(750_000) }),
+  z.object({ type: z.literal("cursor-update"), roomId: z.string().min(1).max(64), line: z.number().int().min(1), column: z.number().int().min(1) }),
 ])
 
 function createRoomDoc() {
@@ -61,12 +68,19 @@ function leaveRoom(ws: WebSocket) {
   }
 }
 
+onSessionRevoked((key) => {
+  for (const [ws, sessionKey] of socketSessions) {
+    if (sessionKey === key) ws.close(1008, "Session revoked")
+  }
+})
+
 wss.on("connection", (ws, request) => {
   const origin = request.headers.origin
   if (origin && !allowedOrigins.includes(origin)) {
     ws.close(1008, "Origin not allowed")
     return
   }
+  const authenticationTimeout = setTimeout(() => ws.close(1008, "Authentication required"), 5_000)
   ws.on("message", (raw: RawData) => {
     let value: unknown
     try {
@@ -81,6 +95,29 @@ wss.on("connection", (ws, request) => {
       return
     }
     const message: WSMessage = result.data
+    if (message.type === "authenticate") {
+      if (socketSessions.has(ws)) {
+        ws.close(1008, "Already authenticated")
+        return
+      }
+      const session = getSession(message.token)
+      if (!session) {
+        ws.close(1008, "Invalid or expired session")
+        return
+      }
+      clearTimeout(authenticationTimeout)
+      socketSessions.set(ws, session.key)
+      socketExpiryTimers.set(ws, setTimeout(() => ws.close(1008, "Session expired"), session.expiresAt - Date.now()))
+      send(ws, { type: "authenticated", user: session.user })
+      return
+    }
+    const sessionKey = socketSessions.get(ws)
+    const authenticatedSession = sessionKey && getSessionByKey(sessionKey)
+    if (!authenticatedSession) {
+      if (!sessionKey) send(ws, { type: "error", message: "Authenticate before sending room messages." })
+      else ws.close(1008, "Session expired or revoked")
+      return
+    }
     if (message.type === "join") {
       let clientStateVector: Uint8Array | undefined
       try {
@@ -93,14 +130,19 @@ wss.on("connection", (ws, request) => {
         return
       }
 
-      leaveRoom(ws)
       const roomId = message.roomId.trim()
+      const userId = authenticatedSession.user.id
+      if (!userId || !hasRoomAccess(roomId, userId)) {
+        send(ws, { type: "error", message: "You are not authorized to join this room." })
+        return
+      }
+      leaveRoom(ws)
       const room = rooms.get(roomId) ?? new Set<WebSocket>()
       const doc = roomDocs.get(roomId) ?? createRoomDoc()
       room.add(ws)
       rooms.set(roomId, room)
       roomDocs.set(roomId, doc)
-      membership.set(ws, { roomId, userId: message.userId })
+      membership.set(ws, { roomId, userId })
       send(ws, {
         type: "joined",
         roomId,
@@ -113,7 +155,7 @@ wss.on("connection", (ws, request) => {
     }
 
     const member = membership.get(ws)
-    if (!member || message.roomId !== member.roomId || message.userId !== member.userId) return
+    if (!member || message.roomId !== member.roomId) return
     if (message.type === "doc-update") {
       const doc = roomDocs.get(member.roomId)
       if (!doc) return
@@ -123,17 +165,27 @@ wss.on("connection", (ws, request) => {
         send(ws, { type: "error", message: "Invalid Yjs document update." })
         return
       }
-      broadcast(member.roomId, message, ws)
+      broadcast(member.roomId, { ...message, userId: member.userId }, ws)
     } else if (message.type === "cursor-update") {
-      broadcast(member.roomId, message, ws)
+      broadcast(member.roomId, { ...message, userId: member.userId }, ws)
     }
   })
-  ws.on("close", () => leaveRoom(ws))
-  ws.on("error", () => leaveRoom(ws))
+  const cleanup = () => {
+    clearTimeout(authenticationTimeout)
+    const expiryTimer = socketExpiryTimers.get(ws)
+    if (expiryTimer) clearTimeout(expiryTimer)
+    socketExpiryTimers.delete(ws)
+    socketSessions.delete(ws)
+    leaveRoom(ws)
+  }
+  ws.on("close", cleanup)
+  ws.on("error", cleanup)
 })
 
 app.use(cors({ origin: allowedOrigins }))
 app.use(express.json({ limit: "32kb" }))
+app.use("/auth", authRoutes)
+app.use("/rooms", roomRoutes)
 app.use("/", executionRoutes)
 app.get("/", (_req, res) => res.send("CodeSync server is running."))
 

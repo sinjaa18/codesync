@@ -34,6 +34,8 @@ Open the application in two browser tabs, join the same room, and start editing.
 | Feature | Description |
 |---|---|
 | 🏠 Room-based collaboration | Join a shared workspace using a room ID |
+| 🔐 Accounts and sessions | Sign up, sign in, and revoke the current session |
+| 🔑 Room authorization | Owners invite registered usernames before they can join |
 | ⚡ Real-time editing | Code changes are synchronized through WebSockets |
 | 🎯 Cursor sharing | Remote cursor positions are synchronized between participants |
 | 👥 Presence | Shows the number of connected participants |
@@ -245,25 +247,25 @@ CodeSync is designed as a learning and portfolio-scale collaborative editor rath
 Current protections include:
 
 - Zod request validation
+- Scrypt password hashing and random bearer sessions with a one-hour expiry
+- Authentication rate limit of 10 attempts per IP per minute
+- Authenticated WebSocket sessions and server-owned collaborator identities
+- Owner-controlled room membership; execution and room APIs require authentication
 - server-side execution request validation
 - external sandbox execution through Judge0
 - bounded source/runtime settings
 - configurable allowed frontend origin
 - no direct server-side `eval()` or dynamic execution
 
-### Important
+### Storage limitation
 
-The public deployment does **not** provide authentication or room-level authorization.
+Accounts, sessions, and room membership are currently stored in process memory. They reset when the backend restarts and do not work across multiple backend instances. PostgreSQL persistence is planned for the next phase; do not treat this deployment as durable account storage.
 
-Room IDs are currently the access mechanism.
+The current authentication system does not include email verification, password reset, or multi-factor authentication.
 
-A production-grade version could add:
+A future persistence and deployment hardening phase could add:
 
 ```text
-Authentication
-      ↓
-Authorized room membership
-      ↓
 Persistent storage
       ↓
 Distributed rate limiting
@@ -282,7 +284,7 @@ cd server
 npm test
 ```
 
-It checks concurrent edits, late joins, room isolation, cursor events, disconnect cleanup, and reconnect reconciliation. It reports loopback update latency for one local run; those measurements are indicative and are not a load test.
+It checks signup, duplicate signup, invalid login, protected endpoints, room invitations, unauthorized WebSocket joins, logout revocation, concurrent edits, late joins, room isolation, cursor events, disconnect cleanup, and reconnect reconciliation. It reports loopback update latency for one local run; those measurements are indicative and are not a load test.
 
 Other deployment and Judge0 checks below reflect prior project verification and are not part of this collaboration integration test.
 
@@ -304,7 +306,7 @@ Verified functionality includes:
 - production frontend/backend communication
 - local collaboration integration test
 
-The production frontend is deployed on Vercel and the backend on Render.
+The production frontend is deployed on Vercel and the backend on Render. The authentication changes in this repository have not been deployed; the public deployment remains on its prior version until these changes are released there.
 
 ---
 
@@ -421,7 +423,7 @@ Open:
 http://localhost:5173
 ```
 
-Open the application in two browser tabs and join the same room.
+Create an account in the application. The first signed-in user to open a room ID owns that room. To collaborate, the owner invites another registered username from the editor toolbar; the invited user can then sign in and enter the room ID.
 
 ---
 
@@ -476,6 +478,26 @@ Response:
 CodeSync server is running.
 ```
 
+### Authentication
+
+```http
+POST /auth/signup
+POST /auth/login
+POST /auth/logout
+GET /auth/me
+```
+
+Signup and login accept `{ "username": "...", "password": "..." }`. Usernames are 3–24 letters, numbers, underscores, or hyphens; passwords are 10–128 characters. Successful signup/login returns a bearer token and user profile. Send the token as `Authorization: Bearer <token>` to protected REST endpoints. Logout revokes the session and closes its authenticated WebSocket connections. The browser keeps the token in memory, so users sign in again after a page refresh.
+
+### Room membership
+
+```http
+POST /rooms/:roomId/access
+POST /rooms/:roomId/invites
+```
+
+The first authenticated user to request access creates the room and becomes its owner. Existing room members can reconnect; only the owner can invite an existing account with `{ "username": "..." }`. The invitation must be sent out of band along with the room ID.
+
 ### Execute Code
 
 ```http
@@ -492,6 +514,7 @@ Example request:
 ```
 
 The server validates the request and submits it to Judge0.
+The endpoint requires a bearer session.
 
 ---
 
@@ -500,6 +523,8 @@ The server validates the request and submits it to Judge0.
 The collaboration protocol uses a small set of events:
 
 ```text
+authenticate { token }
+authenticated { user }
 join (includes Yjs state vector)
 joined (includes Yjs update and state vector)
 doc-update (incremental Yjs update)
@@ -509,6 +534,7 @@ user-left
 ```
 
 The server returns the update missing from the joining client's state vector. Room documents are held in memory and are deleted when the last participant leaves.
+The authenticated account supplies the user identity; clients cannot choose an identity in cursor or document messages.
 
 ---
 
@@ -528,7 +554,7 @@ A server restart removes active rooms and their code.
 
 ### Authentication
 
-There is currently no authentication or authorization system.
+Accounts, sessions, and room ACLs are process-local and reset on restart. Sessions expire after one hour; there is no password recovery or email verification yet.
 
 ### Scaling
 
@@ -551,13 +577,13 @@ Current
   │
   ├── In-memory rooms
   ├── Yjs conflict-free synchronization
-  ├── No authentication
+  ├── In-memory accounts and room ACLs
   └── Single server instance
         │
         ▼
 Next
   │
-  ├── Authentication
+  ├── PostgreSQL-backed accounts, sessions, and room ACLs
   ├── Persistent rooms
   ├── Per-user cursor presence
   ├── Better conflict handling
@@ -597,15 +623,15 @@ CodeSync demonstrates practical understanding of:
 ## 🎯 Demo Scenario
 
 ```text
-1. Open CodeSync
+1. Create an account and open CodeSync
         ↓
-2. Join a room
+2. Enter a new room ID to create a room
         ↓
-3. Open the same room in another tab
+3. Invite a second registered username
         ↓
-4. Start typing
+4. Sign in as that user and open the same room
         ↓
-5. Watch changes synchronize
+5. Start typing and watch changes synchronize
         ↓
 6. Move the cursor
         ↓

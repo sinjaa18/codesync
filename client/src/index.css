@@ -44,7 +44,8 @@ button:disabled { opacity: .6; cursor: wait; }
 .room-details { color: #9da4ad; font-size: 13px; }
 .room-details code { color: #e6e8eb; font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .toolbar { margin-left: auto; }
-.toolbar select { padding: 8px 10px; border: 1px solid #3b4149; border-radius: 6px; background: #23272c; color: #e6e8eb; }
+.toolbar select, .toolbar input { min-width: 0; padding: 8px 10px; border: 1px solid #3b4149; border-radius: 6px; background: #23272c; color: #e6e8eb; }
+.toolbar input { width: 130px; }
 .connection { display: inline-flex; align-items: center; gap: 7px; color: #b2bac4; font-size: 12px; }
 .connection i { width: 7px; height: 7px; border-radius: 50%; background: #7d8792; }
 .connection.connected i { background: #4cbb81; }

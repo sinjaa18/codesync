@@ -8,7 +8,7 @@ const port = 20_000 + Math.floor(Math.random() * 20_000)
 const remoteOrigin = {}
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
 const decode = (value: string) => new Uint8Array(Buffer.from(value, "base64"))
-type Message = { type: string; update?: string; stateVector?: string; count?: number; userId?: string; line?: number; column?: number }
+type Message = { type: string; message?: string; update?: string; stateVector?: string; count?: number; userId?: string; line?: number; column?: number }
 
 function readMessage(raw: WebSocket.RawData): Message | null {
   try {
@@ -46,9 +46,23 @@ async function waitFor(condition: () => boolean, timeoutMs = 3_000) {
   }
 }
 
-type Peer = { ws: WebSocket; doc: Y.Doc; roomId: string; userId: string; sendUpdate: (update: Uint8Array) => void }
+type Peer = { ws: WebSocket; doc: Y.Doc; roomId: string; sendUpdate: (update: Uint8Array) => void }
 
-async function connectPeer(doc: Y.Doc, roomId: string, userId: string): Promise<{ peer: Peer; count: number }> {
+async function api(path: string, token?: string, body?: unknown) {
+  return fetch(`http://127.0.0.1:${port}${path}`, {
+    method: body ? "POST" : "GET",
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  })
+}
+
+async function signup(username: string) {
+  const response = await api("/auth/signup", undefined, { username, password: "test-password-123" })
+  assert.equal(response.status, 201)
+  return (await response.json()) as { token: string }
+}
+
+async function connectPeer(doc: Y.Doc, roomId: string, token: string): Promise<{ peer: Peer; count: number }> {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`)
   await new Promise<void>((resolve, reject) => {
     ws.once("open", resolve)
@@ -57,7 +71,7 @@ async function connectPeer(doc: Y.Doc, roomId: string, userId: string): Promise<
   let joined = false
   const sendUpdate = (update: Uint8Array) => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "doc-update", roomId, userId, update: encode(update) }))
+      ws.send(JSON.stringify({ type: "doc-update", roomId, update: encode(update) }))
     }
   }
   const onDocUpdate = (update: Uint8Array, origin: unknown) => {
@@ -77,15 +91,45 @@ async function connectPeer(doc: Y.Doc, roomId: string, userId: string): Promise<
   doc.on("update", onDocUpdate)
   ws.once("close", () => doc.off("update", onDocUpdate))
 
+  const authenticatedMessage = nextMessage(ws, "authenticated")
+  ws.send(JSON.stringify({ type: "authenticate", token }))
+  await authenticatedMessage
   const joinedMessage = nextMessage(ws, "joined")
-  ws.send(JSON.stringify({ type: "join", roomId, userId, stateVector: encode(Y.encodeStateVector(doc)) }))
+  ws.send(JSON.stringify({ type: "join", roomId, stateVector: encode(Y.encodeStateVector(doc)) }))
   const response = await joinedMessage
   assert.ok(response.update && response.stateVector, "join acknowledgement includes Yjs state and vector")
   Y.applyUpdate(doc, decode(response.update), remoteOrigin)
   joined = true
   const missing = Y.encodeStateAsUpdate(doc, decode(response.stateVector))
   if (missing.length > 2) sendUpdate(missing)
-  return { peer: { ws, doc, roomId, userId, sendUpdate }, count: response.count ?? 0 }
+  return { peer: { ws, doc, roomId, sendUpdate }, count: response.count ?? 0 }
+}
+
+async function assertSocketRequiresAuthentication() {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve)
+    ws.once("error", reject)
+  })
+  const denied = nextMessage(ws, "error")
+  ws.send(JSON.stringify({ type: "join", roomId: "shared" }))
+  assert.match((await denied).message ?? "", /Authenticate/)
+  ws.close()
+}
+
+async function assertSocketRoomDenied(token: string, roomId: string) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve)
+    ws.once("error", reject)
+  })
+  const authenticated = nextMessage(ws, "authenticated")
+  ws.send(JSON.stringify({ type: "authenticate", token }))
+  await authenticated
+  const denied = nextMessage(ws, "error")
+  ws.send(JSON.stringify({ type: "join", roomId }))
+  assert.match((await denied).message ?? "", /not authorized/)
+  ws.close()
 }
 
 test("Yjs collaboration converges concurrent edits and supports join, isolation, cursor, and reconnect", { timeout: 30_000 }, async (t) => {
@@ -110,15 +154,37 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   }
   assert.ok(serverOutput.includes(`listening on port ${port}`), `server should start: ${serverOutput}`)
 
+  const ownerAuth = await signup("room-owner")
+  const duplicate = await api("/auth/signup", undefined, { username: "ROOM-OWNER", password: "test-password-123" })
+  assert.equal(duplicate.status, 409, "duplicate usernames are rejected case-insensitively")
+  const invalidLogin = await api("/auth/login", undefined, { username: "room-owner", password: "incorrect-password" })
+  assert.equal(invalidLogin.status, 401, "invalid credentials are rejected")
+  assert.equal((await api("/auth/me")).status, 401, "protected endpoints reject anonymous requests")
+  assert.equal((await api("/run", undefined, { code: "", language: "javascript" })).status, 401, "execution requires authentication")
+  const login = await api("/auth/login", undefined, { username: "room-owner", password: "test-password-123" })
+  assert.equal(login.status, 200)
+  const ownerToken = ((await login.json()) as { token: string }).token
+  assert.equal((await api("/auth/me", ownerToken)).status, 200, "valid sessions access protected endpoints")
+  const guestAuth = await signup("room-guest")
+  const outsiderAuth = await signup("room-outsider")
+  assert.equal((await api("/rooms/shared/access", ownerToken, {})).status, 201, "first authorized member creates the room ACL")
+  assert.equal((await api("/rooms/shared/access", outsiderAuth.token, {})).status, 403, "uninvited users cannot enter an existing room")
+  assert.equal((await api("/rooms/shared/invites", ownerToken, { username: "room-guest" })).status, 204)
+  assert.equal((await api("/rooms/shared/invites", guestAuth.token, { username: "room-outsider" })).status, 403, "only the owner can change room membership")
+  assert.equal((await api("/rooms/shared/access", guestAuth.token, {})).status, 200)
+  assert.equal((await api("/rooms/separate/access", outsiderAuth.token, {})).status, 201)
+  await assertSocketRequiresAuthentication()
+  await assertSocketRoomDenied(outsiderAuth.token, "shared")
+
   const firstDoc = new Y.Doc()
-  const { peer: first, count: firstCount } = await connectPeer(firstDoc, "shared", "first")
+  const { peer: first, count: firstCount } = await connectPeer(firstDoc, "shared", ownerToken)
   peers.push(first)
   assert.equal(firstCount, 1)
   firstDoc.getText("code").delete(0, firstDoc.getText("code").length)
   firstDoc.getText("code").insert(0, "ab")
 
   const secondDoc = new Y.Doc()
-  const { peer: second, count: secondCount } = await connectPeer(secondDoc, "shared", "second")
+  const { peer: second, count: secondCount } = await connectPeer(secondDoc, "shared", guestAuth.token)
   peers.push(second)
   assert.equal(secondCount, 2)
   assert.equal(secondDoc.getText("code").toString(), "ab", "a new member gets the existing document")
@@ -148,14 +214,14 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   secondDoc.off("update", secondListener)
 
   const isolatedDoc = new Y.Doc()
-  const { peer: isolated } = await connectPeer(isolatedDoc, "separate", "isolated")
+  const { peer: isolated } = await connectPeer(isolatedDoc, "separate", outsiderAuth.token)
   peers.push(isolated)
   assert.equal(isolatedDoc.getText("code").toString(), "console.log('Hello from CodeSync')")
   assert.equal(firstDoc.getText("code").toString(), secondDoc.getText("code").toString())
   assert.equal(isolatedDoc.getText("code").toString(), "console.log('Hello from CodeSync')", "updates do not cross room boundaries")
 
   const cursorReceived = nextMessage(second.ws, "cursor-update")
-  first.ws.send(JSON.stringify({ type: "cursor-update", roomId: "shared", userId: "first", line: 2, column: 4 }))
+  first.ws.send(JSON.stringify({ type: "cursor-update", roomId: "shared", line: 2, column: 4 }))
   const cursor = await cursorReceived
   assert.equal(cursor.line, 2)
   assert.equal(cursor.column, 4)
@@ -165,7 +231,7 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   first.ws.close()
   await Promise.all([leaveReceived, closed])
   firstDoc.getText("code").insert(firstDoc.getText("code").length, "R")
-  const { peer: reconnected } = await connectPeer(firstDoc, "shared", "first")
+  const { peer: reconnected } = await connectPeer(firstDoc, "shared", ownerToken)
   peers.push(reconnected)
   await waitFor(() => secondDoc.getText("code").toString() === firstDoc.getText("code").toString())
   assert.ok(secondDoc.getText("code").toString().endsWith("R"), "offline changes are reconciled after reconnect")
@@ -180,4 +246,17 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   }
   latencies.sort((a, b) => a - b)
   t.diagnostic(`Local WebSocket Yjs sync: 10 sequential updates; p50 ${latencies[4].toFixed(2)} ms, p95 ${latencies[9].toFixed(2)} ms.`)
+
+  const logoutAuth = await signup("logout-user")
+  assert.equal((await api("/rooms/logout-room/access", logoutAuth.token, {})).status, 201)
+  const logoutPeerResult = await connectPeer(new Y.Doc(), "logout-room", logoutAuth.token)
+  peers.push(logoutPeerResult.peer)
+  const logoutClosed = new Promise<void>((resolve) => logoutPeerResult.peer.ws.once("close", () => resolve()))
+  assert.equal((await api("/auth/logout", logoutAuth.token, {})).status, 204)
+  await logoutClosed
+  assert.equal((await api("/auth/me", logoutAuth.token)).status, 401, "logout revokes the session")
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.equal((await api("/auth/login", undefined, { username: "missing-user", password: "incorrect-password" })).status, 401)
+  }
+  assert.equal((await api("/auth/login", undefined, { username: "missing-user", password: "incorrect-password" })).status, 429, "authentication is rate limited by IP")
 })
