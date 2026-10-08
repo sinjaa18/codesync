@@ -237,9 +237,9 @@ C++
 Java
 ```
 
-Code execution is handled by the configured Judge0 Community Edition service.
+Code execution is sent to the configured Judge0 service. CodeSync does not run submitted code in its own Node.js process. The API accepts JavaScript, TypeScript, Python, C++, and Java. The client loads this list from `GET /run/languages`.
 
-The exact compiler/runtime version and public availability depend on the selected Judge0 host.
+Each execution requires an authenticated session and allows source and standard input up to 10 KB each. A user can submit 10 executions per minute per backend process. The server enforces a 10 second total request deadline across submission and polling, and caps each Judge0 response at 128 KiB. Returned stdout, stderr, and compiler output are each limited to 16,000 characters.
 
 ---
 
@@ -255,9 +255,10 @@ Current protections include:
 - Authenticated WebSocket sessions and server-owned collaborator identities
 - Owner-controlled room membership; execution and room APIs require authentication
 - Project owners can invite registered users; project members can access and edit files
-- server-side execution request validation
-- external sandbox execution through Judge0
-- bounded source/runtime settings
+- strict server-side execution request validation and per-user execution rate limiting
+- external sandbox execution through Judge0 with network access disabled
+- server-owned resource limits: 3 seconds CPU, 5 seconds wall time, 128 MB memory, 32 MB stack, 10 processes/threads, and 1 MB maximum file size
+- bounded upstream response size, output size, and total request time
 - configurable allowed frontend origin
 - no direct server-side `eval()` or dynamic execution
 
@@ -290,7 +291,7 @@ The test requires `DATABASE_URL` to point to a migrated PostgreSQL database. It 
 
 It checks signup, duplicate signup, invalid login, protected endpoints, room and project invitations, file creation/rename/deletion, path validation, outsider denial, per-file isolation, three-user presence and cursors, identity spoofing, active-file switching, disconnect/reconnect cleanup, concurrent edits, late joins, logout revocation, and restart recovery. On the local Windows/PostgreSQL 18 run, 10 sequential loopback Yjs updates measured p50 6.19 ms and p95 9.31 ms. This small sample is not a load test.
 
-Other deployment and Judge0 checks below reflect prior project verification and are not part of this collaboration integration test.
+The execution runner tests use a local mocked Judge0 response and do not require the public service. They cover resource settings, output normalization, deadline enforcement, common result statuses, and malformed or oversized service responses. The integration test covers the authenticated API boundary.
 
 Verified functionality includes:
 
@@ -305,7 +306,7 @@ Verified functionality includes:
 - late-join code snapshots
 - malformed and invalid room messages
 - disconnect cleanup
-- Judge0 code execution
+- bounded Judge0 runner behavior with mocked service responses
 - production `/run` API
 - production frontend/backend communication
 - local collaboration integration test

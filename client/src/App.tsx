@@ -6,6 +6,7 @@ const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:5000"
 const wsUrl = import.meta.env.VITE_WS_URL || apiUrl.replace(/^http/, "ws")
 const remoteOrigin = {}
 type ConnectionStatus = "disconnected" | "connecting" | "connected"
+type ExecutionLanguage = { id: string; name: string }
 type ServerMessage = {
   type: string
   message?: string
@@ -50,6 +51,8 @@ export default function App() {
   const [error, setError] = useState("")
   const [output, setOutput] = useState("")
   const [language, setLanguage] = useState("javascript")
+  const [executionLanguages, setExecutionLanguages] = useState<ExecutionLanguage[]>([])
+  const [executionStatus, setExecutionStatus] = useState<"idle" | "running" | "finished">("idle")
   const [doc, setDoc] = useState(() => new Y.Doc())
   const [collaborators, setCollaborators] = useState<Collaborator[]>([])
   const [projects, setProjects] = useState<Project[]>([])
@@ -75,6 +78,17 @@ export default function App() {
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : "Could not load projects."))
   }, [token])
+
+  useEffect(() => {
+    fetch(`${apiUrl}/run/languages`)
+      .then(async (response) => {
+        const data: unknown = await response.json()
+        if (!response.ok || !Array.isArray(data) || !data.every((item) => item && typeof item.id === "string" && typeof item.name === "string")) throw new Error("Could not load execution languages.")
+        setExecutionLanguages(data)
+        setLanguage((current) => data.some((item) => item.id === current) ? current : data[0]?.id ?? "")
+      })
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : "Could not load execution languages."))
+  }, [])
 
   useEffect(() => {
     const sendUpdate = (update: Uint8Array, origin: unknown) => {
@@ -423,7 +437,9 @@ export default function App() {
   }
 
   const runCode = async () => {
-    setOutput("Running…")
+    if (executionStatus === "running" || !executionLanguages.length) return
+    setExecutionStatus("running")
+    setOutput("Running code in the sandbox…")
     setError("")
     try {
       const response = await fetch(`${apiUrl}/run`, {
@@ -433,15 +449,18 @@ export default function App() {
       })
       const raw: unknown = await response.json()
       if (!raw || typeof raw !== "object") throw new Error("The server sent an invalid response.")
-      const data = raw as { stdout?: unknown; stderr?: unknown; error?: unknown; executionTimeMs?: unknown; success?: unknown }
+      const data = raw as { stdout?: unknown; stderr?: unknown; compileOutput?: unknown; outputTruncated?: unknown; status?: unknown; error?: unknown; executionTimeMs?: unknown; requestTimeMs?: unknown; success?: unknown }
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : `Execution failed (HTTP ${response.status}).`)
-      if (typeof data.stdout !== "string" || typeof data.stderr !== "string") throw new Error("The server sent an invalid execution response.")
-      setOutput([data.stdout, data.stderr].filter(Boolean).join("\n") || "Program finished with no output.")
-      if (data.success === false) setError("Execution failed. See the output for details.")
-      if (typeof data.executionTimeMs === "number") setOutput((value) => `${value}\n\nFinished in ${data.executionTimeMs} ms`)
+      if (typeof data.stdout !== "string" || typeof data.stderr !== "string" || typeof data.compileOutput !== "string" || typeof data.success !== "boolean") throw new Error("The server sent an invalid execution response.")
+      const blocks = [data.stdout && `Output:\n${data.stdout}`, data.stderr && `Runtime error:\n${data.stderr}`, data.compileOutput && `Compiler output:\n${data.compileOutput}`].filter(Boolean)
+      const elapsed = [typeof data.executionTimeMs === "number" ? `Program time: ${data.executionTimeMs} ms` : null, typeof data.requestTimeMs === "number" ? `Request time: ${data.requestTimeMs} ms` : null].filter(Boolean).join(" · ")
+      setOutput([blocks.join("\n\n") || "Program finished with no output.", data.outputTruncated ? "Some output was truncated." : "", elapsed].filter(Boolean).join("\n\n"))
+      if (!data.success) setError(data.status === "timeout" ? "The program exceeded its time limit." : "Execution failed. See the output for details.")
     } catch (err) {
       setOutput("")
       setError(err instanceof Error ? err.message : "Execution failed.")
+    } finally {
+      setExecutionStatus("finished")
     }
   }
 
@@ -530,9 +549,9 @@ export default function App() {
         <input aria-label="Invite username" placeholder="Invite username" value={inviteUsername} onChange={(event) => setInviteUsername(event.target.value)} />
         <button className="secondary" disabled={!inviteUsername.trim()} onClick={inviteMember}>Invite</button>
         <select aria-label="Language" value={language} onChange={(event) => setLanguage(event.target.value)}>
-          <option value="javascript">JavaScript</option><option value="typescript">TypeScript</option><option value="cpp">C++</option><option value="python">Python</option><option value="java">Java</option>
+          {executionLanguages.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select>
-        <button onClick={runCode}>Run</button>
+        <button disabled={executionStatus === "running" || executionLanguages.length === 0} onClick={runCode}>{executionStatus === "running" ? "Running…" : "Run"}</button>
         {status === "disconnected" && <button className="secondary" onClick={() => connect()}>Reconnect</button>}
         <button className="secondary" onClick={leaveRoom}>Leave</button>
         <button className="secondary" onClick={logout}>Sign out</button>

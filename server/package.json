@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "npm run db:generate && node --env-file-if-exists=.env --import tsx --watch src/index.ts",
     "build": "npm run db:generate && tsc",
-    "test": "npm run db:generate && npm run test:typecheck && node --env-file-if-exists=.env --import tsx --test test/collaboration.test.ts",
+    "test": "npm run db:generate && npm run test:typecheck && node --env-file-if-exists=.env --import tsx --test test/collaboration.test.ts test/execution.test.ts",
     "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "db:generate": "prisma generate",

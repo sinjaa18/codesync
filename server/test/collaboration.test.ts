@@ -1,12 +1,14 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
+import { createServer } from "node:http"
 import { test } from "node:test"
 import * as Y from "yjs"
 import WebSocket from "ws"
 import { PrismaClient } from "@prisma/client"
 
 const port = 20_000 + Math.floor(Math.random() * 20_000)
+const judgePort = 40_000 + Math.floor(Math.random() * 20_000)
 const remoteOrigin = {}
 const prisma = new PrismaClient()
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
@@ -55,7 +57,7 @@ type Peer = { ws: WebSocket; doc: Y.Doc; roomId: string; sendUpdate: (update: Ui
 function startServer() {
   const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: process.cwd(),
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), JUDGE0_API_URL: `http://127.0.0.1:${judgePort}` },
     stdio: ["ignore", "pipe", "pipe"],
   })
   let output = ""
@@ -171,11 +173,35 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const prefix = `phase3-${randomUUID().slice(0, 8)}-`
   const sharedRoom = `${prefix}shared`
   const isolatedRoom = `${prefix}isolated`
+  const judgeSubmissions = new Map<string, Record<string, unknown>>()
+  let nextSubmission = 0
+  const judge = createServer(async (req, res) => {
+    if (req.method === "POST" && req.url?.startsWith("/submissions?")) {
+      let body = ""
+      for await (const chunk of req) body += chunk.toString()
+      const parsed = JSON.parse(body) as Record<string, unknown>
+      const token = `mock-${++nextSubmission}`
+      judgeSubmissions.set(token, parsed)
+      res.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify({ token }))
+      return
+    }
+    const token = req.url?.split("/")[2]?.split("?")[0]
+    const submission = token ? judgeSubmissions.get(token) : undefined
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+      stdout: `mock output: ${String(submission?.source_code ?? "")}`,
+      stderr: null,
+      compile_output: null,
+      time: "0.012",
+      status: { id: 3, description: "Accepted" },
+    }))
+  })
+  await new Promise<void>((resolve) => judge.listen(judgePort, "127.0.0.1", resolve))
   let running = startServer()
   const peers: Peer[] = []
   t.after(async () => {
     for (const peer of peers) if (peer.ws.readyState === WebSocket.OPEN) peer.ws.close()
     await stopServer(running.child)
+    await new Promise<void>((resolve) => judge.close(() => resolve()))
     await prisma.user.deleteMany({ where: { usernameNormalized: { startsWith: prefix } } })
     await prisma.$disconnect()
   })
@@ -191,10 +217,35 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.equal(invalidLogin.status, 401, "invalid credentials are rejected")
   assert.equal((await api("/auth/me")).status, 401, "protected endpoints reject anonymous requests")
   assert.equal((await api("/run", undefined, { code: "", language: "javascript" })).status, 401, "execution requires authentication")
+  const languageResponse = await api("/run/languages")
+  assert.deepEqual(await languageResponse.json(), [
+    { id: "javascript", name: "JavaScript" },
+    { id: "typescript", name: "TypeScript" },
+    { id: "python", name: "Python" },
+    { id: "cpp", name: "C++" },
+    { id: "java", name: "Java" },
+  ])
   const login = await api("/auth/login", undefined, { username: ownerName, password: "test-password-123" })
   assert.equal(login.status, 200)
   const ownerToken = ((await login.json()) as { token: string }).token
   assert.equal((await api("/auth/me", ownerToken)).status, 200, "valid sessions access protected endpoints")
+  assert.equal((await api("/run", ownerToken, { code: "  ", language: "javascript" })).status, 400, "blank source is rejected")
+  assert.equal((await api("/run", ownerToken, { code: "print(1)", language: "python", cpu_time_limit: 100 })).status, 400, "client cannot set sandbox limits")
+  const execution = await api("/run", ownerToken, { code: "print(1)", language: "python" })
+  assert.equal(execution.status, 200)
+  const executionResult = await execution.json() as Record<string, unknown>
+  assert.equal(executionResult.status, "accepted")
+  assert.equal(executionResult.stdout, "mock output: print(1)")
+  assert.equal(executionResult.stderr, "")
+  assert.equal(executionResult.compileOutput, "")
+  assert.equal(executionResult.outputTruncated, false)
+  assert.equal(executionResult.executionTimeMs, 12)
+  assert.equal(typeof executionResult.requestTimeMs, "number")
+  assert.equal(executionResult.success, true)
+  const submitted = [...judgeSubmissions.values()].at(-1)!
+  assert.equal(submitted.enable_network, false)
+  assert.equal(submitted.cpu_time_limit, 3)
+  assert.equal(submitted.language_id, 71)
   const guestAuth = await signup(guestName)
   const outsiderAuth = await signup(outsiderName)
   assert.equal((await api(`/rooms/${sharedRoom}/access`, ownerToken, {})).status, 201, "first authorized member creates the room ACL")
