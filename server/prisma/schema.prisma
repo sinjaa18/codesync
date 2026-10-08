@@ -1,0 +1,120 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ProjectRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+enum RoomRole {
+  OWNER
+  MEMBER
+}
+
+model User {
+  id                 String            @id @default(cuid())
+  username           String
+  usernameNormalized String            @unique
+  passwordSalt       String
+  passwordHash       String
+  createdAt          DateTime          @default(now())
+  sessions           Session[]
+  ownedProjects      Project[]         @relation("ProjectOwner")
+  projectMemberships ProjectMembership[]
+  ownedRooms         Room[]            @relation("RoomOwner")
+  roomMemberships    RoomMembership[]
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+}
+
+model Project {
+  id          String              @id @default(cuid())
+  name        String
+  ownerId     String
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  owner       User                @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  memberships ProjectMembership[]
+  files       File[]
+  rooms       Room[]
+
+  @@index([ownerId, updatedAt])
+}
+
+model ProjectMembership {
+  projectId String
+  userId    String
+  role      ProjectRole @default(EDITOR)
+  createdAt DateTime    @default(now())
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@index([userId, projectId])
+}
+
+model Room {
+  id          String            @id
+  ownerId     String
+  projectId   String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  owner       User              @relation("RoomOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  project     Project?          @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  memberships RoomMembership[]
+  updates     DocumentUpdate[]
+
+  @@index([ownerId, updatedAt])
+  @@index([projectId])
+}
+
+model RoomMembership {
+  roomId    String
+  userId    String
+  role      RoomRole @default(MEMBER)
+  createdAt DateTime @default(now())
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, userId])
+  @@index([userId, roomId])
+}
+
+model DocumentUpdate {
+  id        BigInt   @id @default(autoincrement())
+  roomId    String
+  update    Bytes
+  createdAt DateTime @default(now())
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([roomId, id])
+}
+
+model File {
+  id        String   @id @default(cuid())
+  projectId String
+  path      String
+  content   String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, path])
+  @@index([projectId, updatedAt])
+}

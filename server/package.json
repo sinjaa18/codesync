@@ -5,16 +5,20 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "dev": "node --env-file-if-exists=.env --import tsx --watch src/index.ts",
-    "build": "tsc",
-    "test": "npm run test:typecheck && tsx --test test/collaboration.test.ts",
+    "dev": "npm run db:generate && node --env-file-if-exists=.env --import tsx --watch src/index.ts",
+    "build": "npm run db:generate && tsc",
+    "test": "npm run db:generate && npm run test:typecheck && node --env-file-if-exists=.env --import tsx --test test/collaboration.test.ts",
     "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
-    "start": "node --env-file-if-exists=.env dist/index.js"
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^6.12.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "ws": "^8.19.0",
@@ -26,7 +30,8 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.3.3",
     "@types/ws": "^8.18.1",
-    "tsx": "^4.21.0",
+    "prisma": "^6.12.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }

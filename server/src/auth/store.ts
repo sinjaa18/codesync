@@ -1,89 +1,80 @@
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto"
 import { promisify } from "node:util"
+import { prisma } from "../db/client.js"
 
 const scrypt = promisify(scryptCallback)
 const sessionLifetimeMs = 60 * 60 * 1000
-
-export type User = { id: string; username: string }
-type StoredUser = User & { salt: string; passwordHash: string }
-type Session = { userId: string; expiresAt: number }
-
-const usersById = new Map<string, StoredUser>()
-const userIdsByName = new Map<string, string>()
-const sessions = new Map<string, Session>()
-const pendingUsernames = new Set<string>()
 const revocationListeners = new Set<(key: string) => void>()
 
+export type User = { id: string; username: string }
 const normalizeUsername = (username: string) => username.trim().toLowerCase()
 const tokenKey = (token: string) => createHash("sha256").update(token).digest("hex")
+const publicUser = (user: { id: string; username: string }): User => ({ id: user.id, username: user.username })
 
-export function findUserByName(username: string) {
-  const id = userIdsByName.get(normalizeUsername(username))
-  return id ? findUserById(id) : undefined
+export async function findUserByName(username: string): Promise<User | undefined> {
+  const user = await prisma.user.findUnique({ where: { usernameNormalized: normalizeUsername(username) } })
+  return user ? publicUser(user) : undefined
 }
 
-export function findUserById(id: string): User | undefined {
-  const user = usersById.get(id)
-  return user && { id: user.id, username: user.username }
+export async function findUserById(id: string): Promise<User | undefined> {
+  const user = await prisma.user.findUnique({ where: { id } })
+  return user ? publicUser(user) : undefined
 }
 
 export async function createUser(username: string, password: string): Promise<User | undefined> {
-  const normalized = normalizeUsername(username)
-  if (userIdsByName.has(normalized) || pendingUsernames.has(normalized)) return undefined
-  pendingUsernames.add(normalized)
+  const salt = randomBytes(16).toString("hex")
+  const passwordHash = (await scrypt(password, salt, 64)) as Buffer
   try {
-    const salt = randomBytes(16).toString("hex")
-    const passwordHash = (await scrypt(password, salt, 64)) as Buffer
-    const user = { id: randomBytes(16).toString("hex"), username: username.trim(), salt, passwordHash: passwordHash.toString("hex") }
-    usersById.set(user.id, user)
-    userIdsByName.set(normalized, user.id)
-    return { id: user.id, username: user.username }
-  } finally {
-    pendingUsernames.delete(normalized)
+    const user = await prisma.user.create({
+      data: { username: username.trim(), usernameNormalized: normalizeUsername(username), passwordSalt: salt, passwordHash: passwordHash.toString("hex") },
+    })
+    return publicUser(user)
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") return undefined
+    throw error
   }
 }
 
 export async function verifyPassword(username: string, password: string) {
-  const id = userIdsByName.get(normalizeUsername(username))
-  const user = id ? usersById.get(id) : undefined
+  const user = await prisma.user.findUnique({ where: { usernameNormalized: normalizeUsername(username) } })
   if (!user) {
     await scrypt(password, "codesync-invalid-user", 64)
     return undefined
   }
-  const candidate = (await scrypt(password, user.salt, 64)) as Buffer
+  const candidate = (await scrypt(password, user.passwordSalt, 64)) as Buffer
   const expected = Buffer.from(user.passwordHash, "hex")
-  return timingSafeEqual(candidate, expected) ? findUserById(user.id) : undefined
+  return timingSafeEqual(candidate, expected) ? publicUser(user) : undefined
 }
 
-export function createSession(userId: string) {
-  for (const [key, session] of sessions) if (session.expiresAt <= Date.now()) sessions.delete(key)
+export async function createSession(userId: string) {
+  const now = new Date()
+  await prisma.session.deleteMany({ where: { expiresAt: { lte: now } } })
   const token = randomBytes(32).toString("base64url")
   const key = tokenKey(token)
-  const expiresAt = Date.now() + sessionLifetimeMs
-  sessions.set(key, { userId, expiresAt })
-  return { token, expiresAt: new Date(expiresAt).toISOString() }
+  const expiresAt = new Date(now.getTime() + sessionLifetimeMs)
+  await prisma.session.create({ data: { id: key, userId, expiresAt } })
+  return { token, expiresAt: expiresAt.toISOString() }
 }
 
-export function getSession(token: string) {
+export async function getSession(token: string) {
   return getSessionByKey(tokenKey(token))
 }
 
-export function getSessionByKey(key: string) {
-  const session = sessions.get(key)
+export async function getSessionByKey(key: string) {
+  const session = await prisma.session.findUnique({ where: { id: key }, include: { user: true } })
   if (!session) return undefined
-  if (session.expiresAt <= Date.now()) {
-    sessions.delete(key)
+  if (session.expiresAt.getTime() <= Date.now()) {
+    await prisma.session.deleteMany({ where: { id: key } })
     return undefined
   }
-  const user = findUserById(session.userId)
-  return user ? { key, user, expiresAt: session.expiresAt } : undefined
+  return { key, user: publicUser(session.user), expiresAt: session.expiresAt.getTime() }
 }
 
-export function revokeSession(token: string) {
+export async function revokeSession(token: string) {
   const key = tokenKey(token)
-  const revoked = sessions.delete(key)
-  if (revoked) for (const listener of revocationListeners) listener(key)
-  return revoked
+  const { count } = await prisma.session.deleteMany({ where: { id: key } })
+  if (count) for (const listener of revocationListeners) listener(key)
+  return count > 0
 }
 
 export function onSessionRevoked(listener: (key: string) => void) {

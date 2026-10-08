@@ -8,8 +8,10 @@ import executionRoutes from "./routes/execution.route.js"
 import authRoutes from "./routes/auth.route.js"
 import roomRoutes from "./routes/room.route.js"
 import type { WSMessage } from "./types/ws.types.js"
-import { getSession, getSessionByKey, onSessionRevoked } from "./auth/store.js"
-import { hasRoomAccess } from "./auth/roomStore.js"
+import { getSession, onSessionRevoked } from "./auth/store.js"
+import type { User } from "./auth/store.js"
+import { hasRoomAccess, loadRoomDocument, persistRoomUpdate } from "./auth/roomStore.js"
+import { prisma } from "./db/client.js"
 
 const app = express()
 const port = Number(process.env.PORT) || 5000
@@ -18,8 +20,10 @@ const wss = new WebSocketServer({ server, maxPayload: 1_000_000 })
 const rooms = new Map<string, Set<WebSocket>>()
 const membership = new Map<WebSocket, { roomId: string; userId: string }>()
 const socketSessions = new Map<WebSocket, string>()
+const socketUsers = new Map<WebSocket, User>()
 const socketExpiryTimers = new Map<WebSocket, NodeJS.Timeout>()
 const roomDocs = new Map<string, Y.Doc>()
+const roomDocLoads = new Map<string, Promise<Y.Doc>>()
 const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()) ?? ["http://localhost:5173"]
 
 const messageSchema = z.discriminatedUnion("type", [
@@ -29,10 +33,22 @@ const messageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cursor-update"), roomId: z.string().min(1).max(64), line: z.number().int().min(1), column: z.number().int().min(1) }),
 ])
 
-function createRoomDoc() {
-  const doc = new Y.Doc()
-  doc.getText("code").insert(0, "console.log('Hello from CodeSync')")
-  return doc
+function getRoomDoc(roomId: string) {
+  const existing = roomDocs.get(roomId)
+  if (existing) return Promise.resolve(existing)
+  let loading = roomDocLoads.get(roomId)
+  if (!loading) {
+    loading = loadRoomDocument(roomId)
+    roomDocLoads.set(roomId, loading)
+  }
+  return loading.then((doc) => {
+    roomDocs.set(roomId, doc)
+    if (roomDocLoads.get(roomId) === loading) roomDocLoads.delete(roomId)
+    return doc
+  }).catch((error) => {
+    if (roomDocLoads.get(roomId) === loading) roomDocLoads.delete(roomId)
+    throw error
+  })
 }
 
 function decodeBase64(value: string) {
@@ -81,7 +97,7 @@ wss.on("connection", (ws, request) => {
     return
   }
   const authenticationTimeout = setTimeout(() => ws.close(1008, "Authentication required"), 5_000)
-  ws.on("message", (raw: RawData) => {
+  ws.on("message", async (raw: RawData) => {
     let value: unknown
     try {
       value = JSON.parse(raw.toString())
@@ -100,20 +116,21 @@ wss.on("connection", (ws, request) => {
         ws.close(1008, "Already authenticated")
         return
       }
-      const session = getSession(message.token)
+      const session = await getSession(message.token)
       if (!session) {
         ws.close(1008, "Invalid or expired session")
         return
       }
       clearTimeout(authenticationTimeout)
       socketSessions.set(ws, session.key)
+      socketUsers.set(ws, session.user)
       socketExpiryTimers.set(ws, setTimeout(() => ws.close(1008, "Session expired"), session.expiresAt - Date.now()))
       send(ws, { type: "authenticated", user: session.user })
       return
     }
     const sessionKey = socketSessions.get(ws)
-    const authenticatedSession = sessionKey && getSessionByKey(sessionKey)
-    if (!authenticatedSession) {
+    const authenticatedUser = socketUsers.get(ws)
+    if (!sessionKey || !authenticatedUser) {
       if (!sessionKey) send(ws, { type: "error", message: "Authenticate before sending room messages." })
       else ws.close(1008, "Session expired or revoked")
       return
@@ -131,14 +148,14 @@ wss.on("connection", (ws, request) => {
       }
 
       const roomId = message.roomId.trim()
-      const userId = authenticatedSession.user.id
-      if (!userId || !hasRoomAccess(roomId, userId)) {
+      const userId = authenticatedUser.id
+      if (!userId || !await hasRoomAccess(roomId, userId)) {
         send(ws, { type: "error", message: "You are not authorized to join this room." })
         return
       }
       leaveRoom(ws)
       const room = rooms.get(roomId) ?? new Set<WebSocket>()
-      const doc = roomDocs.get(roomId) ?? createRoomDoc()
+      const doc = await getRoomDoc(roomId)
       room.add(ws)
       rooms.set(roomId, room)
       roomDocs.set(roomId, doc)
@@ -160,9 +177,11 @@ wss.on("connection", (ws, request) => {
       const doc = roomDocs.get(member.roomId)
       if (!doc) return
       try {
-        Y.applyUpdate(doc, decodeBase64(message.update))
+        const update = decodeBase64(message.update)
+        Y.applyUpdate(doc, update)
+        await persistRoomUpdate(member.roomId, update)
       } catch {
-        send(ws, { type: "error", message: "Invalid Yjs document update." })
+        send(ws, { type: "error", message: "The document update could not be applied or saved." })
         return
       }
       broadcast(member.roomId, { ...message, userId: member.userId }, ws)
@@ -176,6 +195,7 @@ wss.on("connection", (ws, request) => {
     if (expiryTimer) clearTimeout(expiryTimer)
     socketExpiryTimers.delete(ws)
     socketSessions.delete(ws)
+    socketUsers.delete(ws)
     leaveRoom(ws)
   }
   ws.on("close", cleanup)
@@ -189,4 +209,10 @@ app.use("/rooms", roomRoutes)
 app.use("/", executionRoutes)
 app.get("/", (_req, res) => res.send("CodeSync server is running."))
 
-server.listen(port, () => console.log(`CodeSync server listening on port ${port}`))
+try {
+  await prisma.$connect()
+  server.listen(port, () => console.log(`CodeSync server listening on port ${port}`))
+} catch (error) {
+  console.error("CodeSync could not connect to PostgreSQL.", error)
+  process.exitCode = 1
+}

@@ -80,7 +80,7 @@ Open the application in two browser tabs, join the same room, and start editing.
       ws WebSocket Server
              │
              ▼
-      In-Memory Room State
+      PostgreSQL via Prisma
 ```
 
 ### Collaboration Flow
@@ -92,7 +92,7 @@ User A
   ▼
 WebSocket Server
   │
-  ├── update room state
+  ├── append Yjs update to PostgreSQL
   │
   └── broadcast to other members
               │
@@ -174,7 +174,7 @@ Room ID
    └── latest code
 ```
 
-When the last participant leaves, the room state is removed from memory.
+When the last participant leaves, the in-memory document cache is dropped. The persisted Yjs updates remain in PostgreSQL and are replayed when the room is opened again.
 
 ---
 
@@ -259,15 +259,13 @@ Current protections include:
 
 ### Storage limitation
 
-Accounts, sessions, and room membership are currently stored in process memory. They reset when the backend restarts and do not work across multiple backend instances. PostgreSQL persistence is planned for the next phase; do not treat this deployment as durable account storage.
+Accounts, sessions, room membership, project metadata, file records, and Yjs updates are stored in PostgreSQL. Active WebSocket connections and document caches remain process-local, so realtime broadcasts still require a single backend instance.
 
 The current authentication system does not include email verification, password reset, or multi-factor authentication.
 
-A future persistence and deployment hardening phase could add:
+A future operations and deployment phase could add:
 
 ```text
-Persistent storage
-      ↓
 Distributed rate limiting
       ↓
 Stronger execution isolation
@@ -283,6 +281,8 @@ Run the local collaboration integration test with:
 cd server
 npm test
 ```
+
+The test requires `DATABASE_URL` to point to a migrated PostgreSQL database. It creates uniquely named test data and deletes its test users afterward.
 
 It checks signup, duplicate signup, invalid login, protected endpoints, room invitations, unauthorized WebSocket joins, logout revocation, concurrent edits, late joins, room isolation, cursor events, disconnect cleanup, and reconnect reconciliation. It reports loopback update latency for one local run; those measurements are indicative and are not a load test.
 
@@ -328,6 +328,8 @@ The production frontend is deployed on Vercel and the backend on Render. The aut
 - Express
 - `ws`
 - Zod
+- Prisma ORM
+- PostgreSQL
 
 ### Code Execution
 
@@ -376,6 +378,7 @@ CodeSync/
 ### Prerequisites
 
 - Node.js 22.12+
+- PostgreSQL 14+
 - npm
 
 ### 1. Clone
@@ -385,12 +388,24 @@ git clone https://github.com/sinjaa18/codesync.git
 cd codesync
 ```
 
-### 2. Start the Backend
+### 2. Create a Local Database
+
+Create a development role and database using a PostgreSQL administrator account:
+
+```sql
+CREATE ROLE codesync LOGIN PASSWORD 'choose-a-local-password' CREATEDB;
+CREATE DATABASE codesync OWNER codesync;
+```
+
+`CREATEDB` lets Prisma create its temporary shadow database for local migrations. Production deploys should use `npm run db:deploy`, which does not need that permission.
+
+### 3. Start the Backend
 
 ```bash
 cd server
-npm install
 cp .env.example .env
+npm install
+npm run db:migrate -- --name init
 npm run dev
 ```
 
@@ -400,7 +415,7 @@ On PowerShell:
 Copy-Item .env.example .env
 ```
 
-### 3. Start the Frontend
+### 4. Start the Frontend
 
 Open another terminal:
 
@@ -453,6 +468,7 @@ These values are exposed to the browser and should therefore contain only public
 
 ```env
 PORT=5000
+DATABASE_URL=postgresql://codesync:replace-with-local-password@localhost:5432/codesync?schema=public
 CLIENT_ORIGIN=http://localhost:5173
 JUDGE0_API_URL=https://ce.judge0.com
 JUDGE0_AUTH_TOKEN=
@@ -461,6 +477,21 @@ JUDGE0_AUTH_TOKEN=
 The Judge0 token is optional and depends on the configured Judge0 provider.
 
 Never commit real secrets.
+`DATABASE_URL` is used by the server and Prisma migrations. Percent-encode reserved characters in the username or password and use a managed PostgreSQL connection string for deployment.
+Apply pending deployment migrations with `npm run db:deploy` before starting the updated backend.
+
+---
+
+## 🗄️ Data Model
+
+Prisma manages these PostgreSQL tables:
+
+- `User` and `Session` for accounts and hashed, expiring bearer sessions
+- `Room` and `RoomMembership` for room ownership and access
+- `DocumentUpdate` for the ordered Yjs update log used to restore room documents
+- `Project`, `ProjectMembership`, and `File` for the upcoming workspace APIs
+
+Foreign keys cascade when an owner or parent record is removed. Indexes cover session expiry, room membership lookups, project membership lookups, and per-room update replay.
 
 ---
 
@@ -533,7 +564,7 @@ users (participant count)
 user-left
 ```
 
-The server returns the update missing from the joining client's state vector. Room documents are held in memory and are deleted when the last participant leaves.
+The server returns the update missing from the joining client's state vector. It appends received Yjs updates to PostgreSQL and replays them to rebuild the in-memory document cache when a room is opened.
 The authenticated account supplies the user identity; clients cannot choose an identity in cursor or document messages.
 
 ---
@@ -544,21 +575,19 @@ CodeSync intentionally keeps the architecture simple.
 
 ### Collaboration
 
-Yjs merges concurrent text edits. Room documents remain in process memory; they are not persisted after the last participant leaves or a server restart.
+Yjs merges concurrent text edits. Updates persist in PostgreSQL as an append-only log; log compaction is not implemented.
 
 ### Persistence
 
-Room state exists only in server memory.
-
-A server restart removes active rooms and their code.
+PostgreSQL stores accounts, sessions, room memberships, and collaborative document updates. Project and file models exist, but their APIs are part of the next workspace phase.
 
 ### Authentication
 
-Accounts, sessions, and room ACLs are process-local and reset on restart. Sessions expire after one hour; there is no password recovery or email verification yet.
+Sessions persist in PostgreSQL and expire after one hour; there is no password recovery or email verification yet.
 
 ### Scaling
 
-The current room state is process-local and designed for a single server instance.
+Active WebSocket connections and document caches are process-local. Multiple backend instances need shared broadcasting before realtime collaboration can span them.
 
 ### Presence
 
@@ -575,27 +604,25 @@ Code execution depends on the configured external Judge0 service and its availab
 ```text
 Current
   │
-  ├── In-memory rooms
+  ├── PostgreSQL accounts, sessions, rooms, and Yjs updates
   ├── Yjs conflict-free synchronization
-  ├── In-memory accounts and room ACLs
+  ├── Process-local WebSocket connections
   └── Single server instance
         │
         ▼
 Next
   │
-  ├── PostgreSQL-backed accounts, sessions, and room ACLs
-  ├── Persistent rooms
+  ├── Project and file APIs backed by PostgreSQL
   ├── Per-user cursor presence
-  ├── Better conflict handling
-  └── Rate limiting
+  └── Project and file authorization APIs
         │
         ▼
 Future
   │
-  ├── Persistent room history
+  ├── Yjs update compaction and history browsing
   ├── Redis-based distributed presence
   ├── Multi-instance WebSocket scaling
-  ├── Persistent project/workspace storage
+  ├── Distributed rate limiting
   └── Collaborative project management
 ```
 

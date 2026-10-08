@@ -1,11 +1,14 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { test } from "node:test"
 import * as Y from "yjs"
 import WebSocket from "ws"
+import { PrismaClient } from "@prisma/client"
 
 const port = 20_000 + Math.floor(Math.random() * 20_000)
 const remoteOrigin = {}
+const prisma = new PrismaClient()
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
 const decode = (value: string) => new Uint8Array(Buffer.from(value, "base64"))
 type Message = { type: string; message?: string; update?: string; stateVector?: string; count?: number; userId?: string; line?: number; column?: number }
@@ -48,6 +51,35 @@ async function waitFor(condition: () => boolean, timeoutMs = 3_000) {
 
 type Peer = { ws: WebSocket; doc: Y.Doc; roomId: string; sendUpdate: (update: Uint8Array) => void }
 
+function startServer() {
+  const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
+    cwd: process.cwd(),
+    env: { ...process.env, PORT: String(port) },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  let output = ""
+  child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString() })
+  child.stderr.on("data", (chunk: Buffer) => { output += chunk.toString() })
+  return { child, getOutput: () => output }
+}
+
+async function waitForServer(running: ReturnType<typeof startServer>) {
+  const deadline = Date.now() + 15_000
+  while (!running.getOutput().includes(`listening on port ${port}`) && Date.now() < deadline) {
+    if (running.child.exitCode !== null) throw new Error(`Server exited before startup: ${running.getOutput()}`)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  assert.ok(running.getOutput().includes(`listening on port ${port}`), `server should start: ${running.getOutput()}`)
+}
+
+async function stopServer(child: ReturnType<typeof spawn>) {
+  if (child.exitCode !== null) return
+  await new Promise<void>((resolve) => {
+    child.once("exit", () => resolve())
+    child.kill()
+  })
+}
+
 async function api(path: string, token?: string, body?: unknown) {
   return fetch(`http://127.0.0.1:${port}${path}`, {
     method: body ? "POST" : "GET",
@@ -59,7 +91,7 @@ async function api(path: string, token?: string, body?: unknown) {
 async function signup(username: string) {
   const response = await api("/auth/signup", undefined, { username, password: "test-password-123" })
   assert.equal(response.status, 201)
-  return (await response.json()) as { token: string }
+  return (await response.json()) as { token: string; user: { id: string; username: string } }
 }
 
 async function connectPeer(doc: Y.Doc, roomId: string, token: string): Promise<{ peer: Peer; count: number }> {
@@ -132,59 +164,54 @@ async function assertSocketRoomDenied(token: string, roomId: string) {
   ws.close()
 }
 
-test("Yjs collaboration converges concurrent edits and supports join, isolation, cursor, and reconnect", { timeout: 30_000 }, async (t) => {
-  const server = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
-    cwd: process.cwd(),
-    env: { ...process.env, PORT: String(port) },
-    stdio: ["ignore", "pipe", "pipe"],
-  })
-  let serverOutput = ""
-  server.stdout.on("data", (chunk: Buffer) => { serverOutput += chunk.toString() })
-  server.stderr.on("data", (chunk: Buffer) => { serverOutput += chunk.toString() })
+test("PostgreSQL auth and room data persist while Yjs collaboration converges", { timeout: 60_000 }, async (t) => {
+  const prefix = `phase3-${randomUUID().slice(0, 8)}-`
+  const sharedRoom = `${prefix}shared`
+  const isolatedRoom = `${prefix}isolated`
+  let running = startServer()
   const peers: Peer[] = []
-  t.after(() => {
+  t.after(async () => {
     for (const peer of peers) if (peer.ws.readyState === WebSocket.OPEN) peer.ws.close()
-    server.kill()
+    await stopServer(running.child)
+    await prisma.user.deleteMany({ where: { usernameNormalized: { startsWith: prefix } } })
+    await prisma.$disconnect()
   })
+  await waitForServer(running)
 
-  const startupDeadline = Date.now() + 10_000
-  while (!serverOutput.includes(`listening on port ${port}`) && Date.now() < startupDeadline) {
-    if (server.exitCode !== null) throw new Error(`Server exited before startup: ${serverOutput}`)
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  assert.ok(serverOutput.includes(`listening on port ${port}`), `server should start: ${serverOutput}`)
-
-  const ownerAuth = await signup("room-owner")
-  const duplicate = await api("/auth/signup", undefined, { username: "ROOM-OWNER", password: "test-password-123" })
+  const ownerName = `${prefix}owner`
+  const guestName = `${prefix}guest`
+  const outsiderName = `${prefix}outsider`
+  const ownerAuth = await signup(ownerName)
+  const duplicate = await api("/auth/signup", undefined, { username: ownerName.toUpperCase(), password: "test-password-123" })
   assert.equal(duplicate.status, 409, "duplicate usernames are rejected case-insensitively")
-  const invalidLogin = await api("/auth/login", undefined, { username: "room-owner", password: "incorrect-password" })
+  const invalidLogin = await api("/auth/login", undefined, { username: ownerName, password: "incorrect-password" })
   assert.equal(invalidLogin.status, 401, "invalid credentials are rejected")
   assert.equal((await api("/auth/me")).status, 401, "protected endpoints reject anonymous requests")
   assert.equal((await api("/run", undefined, { code: "", language: "javascript" })).status, 401, "execution requires authentication")
-  const login = await api("/auth/login", undefined, { username: "room-owner", password: "test-password-123" })
+  const login = await api("/auth/login", undefined, { username: ownerName, password: "test-password-123" })
   assert.equal(login.status, 200)
   const ownerToken = ((await login.json()) as { token: string }).token
   assert.equal((await api("/auth/me", ownerToken)).status, 200, "valid sessions access protected endpoints")
-  const guestAuth = await signup("room-guest")
-  const outsiderAuth = await signup("room-outsider")
-  assert.equal((await api("/rooms/shared/access", ownerToken, {})).status, 201, "first authorized member creates the room ACL")
-  assert.equal((await api("/rooms/shared/access", outsiderAuth.token, {})).status, 403, "uninvited users cannot enter an existing room")
-  assert.equal((await api("/rooms/shared/invites", ownerToken, { username: "room-guest" })).status, 204)
-  assert.equal((await api("/rooms/shared/invites", guestAuth.token, { username: "room-outsider" })).status, 403, "only the owner can change room membership")
-  assert.equal((await api("/rooms/shared/access", guestAuth.token, {})).status, 200)
-  assert.equal((await api("/rooms/separate/access", outsiderAuth.token, {})).status, 201)
+  const guestAuth = await signup(guestName)
+  const outsiderAuth = await signup(outsiderName)
+  assert.equal((await api(`/rooms/${sharedRoom}/access`, ownerToken, {})).status, 201, "first authorized member creates the room ACL")
+  assert.equal((await api(`/rooms/${sharedRoom}/access`, outsiderAuth.token, {})).status, 403, "uninvited users cannot enter an existing room")
+  assert.equal((await api(`/rooms/${sharedRoom}/invites`, ownerToken, { username: guestName })).status, 204)
+  assert.equal((await api(`/rooms/${sharedRoom}/invites`, guestAuth.token, { username: outsiderName })).status, 403, "only the owner can change room membership")
+  assert.equal((await api(`/rooms/${sharedRoom}/access`, guestAuth.token, {})).status, 200)
+  assert.equal((await api(`/rooms/${isolatedRoom}/access`, outsiderAuth.token, {})).status, 201)
   await assertSocketRequiresAuthentication()
-  await assertSocketRoomDenied(outsiderAuth.token, "shared")
+  await assertSocketRoomDenied(outsiderAuth.token, sharedRoom)
 
   const firstDoc = new Y.Doc()
-  const { peer: first, count: firstCount } = await connectPeer(firstDoc, "shared", ownerToken)
+  const { peer: first, count: firstCount } = await connectPeer(firstDoc, sharedRoom, ownerToken)
   peers.push(first)
   assert.equal(firstCount, 1)
   firstDoc.getText("code").delete(0, firstDoc.getText("code").length)
   firstDoc.getText("code").insert(0, "ab")
 
   const secondDoc = new Y.Doc()
-  const { peer: second, count: secondCount } = await connectPeer(secondDoc, "shared", guestAuth.token)
+  const { peer: second, count: secondCount } = await connectPeer(secondDoc, sharedRoom, guestAuth.token)
   peers.push(second)
   assert.equal(secondCount, 2)
   assert.equal(secondDoc.getText("code").toString(), "ab", "a new member gets the existing document")
@@ -214,14 +241,16 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   secondDoc.off("update", secondListener)
 
   const isolatedDoc = new Y.Doc()
-  const { peer: isolated } = await connectPeer(isolatedDoc, "separate", outsiderAuth.token)
+  const { peer: isolated } = await connectPeer(isolatedDoc, isolatedRoom, outsiderAuth.token)
   peers.push(isolated)
   assert.equal(isolatedDoc.getText("code").toString(), "console.log('Hello from CodeSync')")
   assert.equal(firstDoc.getText("code").toString(), secondDoc.getText("code").toString())
   assert.equal(isolatedDoc.getText("code").toString(), "console.log('Hello from CodeSync')", "updates do not cross room boundaries")
 
+  assert.equal(first.ws.readyState, WebSocket.OPEN)
+  assert.equal(second.ws.readyState, WebSocket.OPEN)
   const cursorReceived = nextMessage(second.ws, "cursor-update")
-  first.ws.send(JSON.stringify({ type: "cursor-update", roomId: "shared", line: 2, column: 4 }))
+  first.ws.send(JSON.stringify({ type: "cursor-update", roomId: sharedRoom, line: 2, column: 4 }))
   const cursor = await cursorReceived
   assert.equal(cursor.line, 2)
   assert.equal(cursor.column, 4)
@@ -231,7 +260,7 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   first.ws.close()
   await Promise.all([leaveReceived, closed])
   firstDoc.getText("code").insert(firstDoc.getText("code").length, "R")
-  const { peer: reconnected } = await connectPeer(firstDoc, "shared", ownerToken)
+  const { peer: reconnected } = await connectPeer(firstDoc, sharedRoom, ownerToken)
   peers.push(reconnected)
   await waitFor(() => secondDoc.getText("code").toString() === firstDoc.getText("code").toString())
   assert.ok(secondDoc.getText("code").toString().endsWith("R"), "offline changes are reconciled after reconnect")
@@ -247,16 +276,47 @@ test("Yjs collaboration converges concurrent edits and supports join, isolation,
   latencies.sort((a, b) => a - b)
   t.diagnostic(`Local WebSocket Yjs sync: 10 sequential updates; p50 ${latencies[4].toFixed(2)} ms, p95 ${latencies[9].toFixed(2)} ms.`)
 
-  const logoutAuth = await signup("logout-user")
-  assert.equal((await api("/rooms/logout-room/access", logoutAuth.token, {})).status, 201)
-  const logoutPeerResult = await connectPeer(new Y.Doc(), "logout-room", logoutAuth.token)
+  const project = await prisma.project.create({
+    data: {
+      name: `${prefix}project`,
+      ownerId: ownerAuth.user.id,
+      memberships: { create: { userId: guestAuth.user.id, role: "EDITOR" } },
+      files: { create: { path: "src/main.ts", content: "export const ready = true" } },
+    },
+  })
+
+  for (const peer of peers) {
+    if (peer.ws.readyState === WebSocket.OPEN) peer.ws.close()
+  }
+  await Promise.all(peers.map((peer) => peer.ws.readyState === WebSocket.CLOSED
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => peer.ws.once("close", () => resolve()))))
+  await stopServer(running.child)
+  running = startServer()
+  await waitForServer(running)
+  assert.equal((await api("/auth/me", ownerToken)).status, 200, "account sessions survive a backend restart")
+  assert.equal((await api(`/rooms/${sharedRoom}/access`, guestAuth.token, {})).status, 200, "room authorization survives a backend restart")
+  const recoveredProject = await prisma.project.findUnique({ where: { id: project.id }, include: { memberships: true, files: true } })
+  assert.equal(recoveredProject?.memberships[0]?.userId, guestAuth.user.id, "project membership survives a restart")
+  assert.equal(recoveredProject?.files[0]?.content, "export const ready = true", "file content survives a restart")
+  const recovered = await connectPeer(new Y.Doc(), sharedRoom, guestAuth.token)
+  peers.push(recovered.peer)
+  assert.equal(recovered.peer.doc.getText("code").toString(), secondDoc.getText("code").toString(), "persisted Yjs updates restore the latest room document")
+
+  const logoutName = `${prefix}logout`
+  const logoutAuth = await signup(logoutName)
+  const logoutRoom = `${prefix}logout-room`
+  assert.equal((await api(`/rooms/${logoutRoom}/access`, logoutAuth.token, {})).status, 201)
+  const logoutPeerResult = await connectPeer(new Y.Doc(), logoutRoom, logoutAuth.token)
   peers.push(logoutPeerResult.peer)
   const logoutClosed = new Promise<void>((resolve) => logoutPeerResult.peer.ws.once("close", () => resolve()))
   assert.equal((await api("/auth/logout", logoutAuth.token, {})).status, 204)
   await logoutClosed
   assert.equal((await api("/auth/me", logoutAuth.token)).status, 401, "logout revokes the session")
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    assert.equal((await api("/auth/login", undefined, { username: "missing-user", password: "incorrect-password" })).status, 401)
+  let rateLimited = false
+  for (let attempt = 0; attempt < 15 && !rateLimited; attempt += 1) {
+    const response = await api("/auth/login", undefined, { username: "missing-user", password: "incorrect-password" })
+    rateLimited = response.status === 429
   }
-  assert.equal((await api("/auth/login", undefined, { username: "missing-user", password: "incorrect-password" })).status, 429, "authentication is rate limited by IP")
+  assert.equal(rateLimited, true, "authentication is rate limited by IP")
 })

@@ -19,7 +19,7 @@ router.post("/signup", authRateLimit, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Username must be 3–24 letters, numbers, underscores, or hyphens; password must be 10–128 characters." })
   const user = await createUser(parsed.data.username, parsed.data.password)
   if (!user) return res.status(409).json({ error: "That username is already registered." })
-  res.status(201).json({ user, ...createSession(user.id) })
+  res.status(201).json({ user, ...(await createSession(user.id)) })
 })
 
 router.post("/login", authRateLimit, async (req, res) => {
@@ -27,17 +27,17 @@ router.post("/login", authRateLimit, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid username or password." })
   const user = await verifyPassword(parsed.data.username, parsed.data.password)
   if (!user) return res.status(401).json({ error: "Invalid username or password." })
-  res.json({ user, ...createSession(user.id) })
+  res.json({ user, ...(await createSession(user.id)) })
 })
 
-router.post("/logout", requireAuth, (req, res) => {
+router.post("/logout", requireAuth, async (req, res) => {
   const token = getBearerToken(req)
-  if (token) revokeSession(token)
+  if (token) await revokeSession(token)
   res.status(204).end()
 })
 
-router.get("/me", requireAuth, (req, res) => {
-  const user = findUserById(res.locals.userId!)
+router.get("/me", requireAuth, async (_req, res) => {
+  const user = await findUserById(res.locals.userId!)
   if (!user) return res.status(401).json({ error: "Session is no longer valid." })
   res.json({ user })
 })

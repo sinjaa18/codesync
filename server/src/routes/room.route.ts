@@ -8,21 +8,21 @@ const router = Router()
 router.use(requireAuth)
 const roomIdSchema = z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/)
 
-router.post("/:roomId/access", (req, res) => {
+router.post("/:roomId/access", async (req, res) => {
   const parsed = roomIdSchema.safeParse(req.params.roomId)
   if (!parsed.success) return res.status(400).json({ error: "Invalid room ID." })
-  const access = ensureRoomAccess(parsed.data, res.locals.userId!)
+  const access = await ensureRoomAccess(parsed.data, res.locals.userId!)
   if (!access.allowed) return res.status(403).json({ error: "You do not have access to this room. Ask its owner to invite your username." })
   res.status(access.created ? 201 : 200).json({ roomId: parsed.data })
 })
 
-router.post("/:roomId/invites", (req, res) => {
+router.post("/:roomId/invites", async (req, res) => {
   const roomId = roomIdSchema.safeParse(req.params.roomId)
   const body = z.object({ username: z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_-]+$/) }).strict().safeParse(req.body)
   if (!roomId.success || !body.success) return res.status(400).json({ error: "Invalid room ID or username." })
-  const user = findUserByName(body.data.username)
+  const user = await findUserByName(body.data.username)
   if (!user) return res.status(404).json({ error: "No account found for that username." })
-  if (!inviteRoomMember(roomId.data, res.locals.userId!, user.id)) return res.status(403).json({ error: "Only the room owner can invite participants." })
+  if (!await inviteRoomMember(roomId.data, res.locals.userId!, user.id)) return res.status(403).json({ error: "Only the room owner can invite participants." })
   res.status(204).end()
 })
 
