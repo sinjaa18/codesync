@@ -1,6 +1,7 @@
 import express from "express"
 import cors from "cors"
 import { createServer } from "node:http"
+import { randomUUID } from "node:crypto"
 import { WebSocketServer, WebSocket, type RawData } from "ws"
 import { z } from "zod"
 import * as Y from "yjs"
@@ -13,6 +14,9 @@ import { getSession, onSessionRevoked } from "./auth/store.js"
 import type { User } from "./auth/store.js"
 import { getRoomPresenceContext, hasRoomAccess, loadRoomDocument, persistRoomUpdate } from "./auth/roomStore.js"
 import { prisma } from "./db/client.js"
+import { errorHandler, httpRequestLogger, notFoundHandler, requestContext } from "./observability/http.js"
+import { createReadinessHandler, healthHandler } from "./observability/health.js"
+import { isDatabaseError, logError, logInfo, logWarn, safeCloseReason, safeErrorFields } from "./observability/logger.js"
 
 const app = express()
 const port = Number(process.env.PORT) || 5000
@@ -21,7 +25,7 @@ const wss = new WebSocketServer({ server, maxPayload: 1_000_000 })
 const rooms = new Map<string, Set<WebSocket>>()
 type PresenceCursor = { line: number; column: number } | null
 type Presence = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: PresenceCursor; online: true }
-type Membership = { roomId: string; userId: string; scopeKey: string }
+type Membership = { roomId: string; userId: string; scopeKey: string; projectId: string | null; fileId: string | null }
 const membership = new Map<WebSocket, Membership>()
 const presenceScopes = new Map<string, Map<string, { ws: WebSocket; presence: Presence }>>()
 const socketSessions = new Map<WebSocket, string>()
@@ -117,41 +121,62 @@ onSessionRevoked((key) => {
 })
 
 wss.on("connection", (ws, request) => {
+  const connectionId = randomUUID()
+  const connectedAt = performance.now()
+  let authenticatedUserId: string | undefined
+  let activeRoomId: string | undefined
+  let activeProjectId: string | null = null
+  let activeFileId: string | null = null
+  let cleanedUp = false
   const origin = request.headers.origin
   if (origin && !allowedOrigins.includes(origin)) {
+    logWarn("websocket.connection_rejected", { connectionId, reason: "origin_not_allowed" })
     ws.close(1008, "Origin not allowed")
     return
   }
-  const authenticationTimeout = setTimeout(() => ws.close(1008, "Authentication required"), 5_000)
+  logInfo("websocket.connection_accepted", { connectionId })
+  const authenticationTimeout = setTimeout(() => {
+    logWarn("websocket.authentication_timeout", { connectionId })
+    ws.close(1008, "Authentication required")
+  }, 5_000)
   ws.on("message", async (raw: RawData) => {
+    let stage = "message_validation"
+    try {
     let value: unknown
     try {
       value = JSON.parse(raw.toString())
     } catch {
+      logWarn("websocket.protocol_rejected", { connectionId, reason: "invalid_json" })
       send(ws, { type: "error", message: "Message must be valid JSON." })
       return
     }
     const result = messageSchema.safeParse(value)
     if (!result.success) {
+      logWarn("websocket.protocol_rejected", { connectionId, reason: "invalid_message" })
       send(ws, { type: "error", message: "Invalid message." })
       return
     }
     const message: WSMessage = result.data
     if (message.type === "authenticate") {
       if (socketSessions.has(ws)) {
+        logWarn("websocket.authentication_rejected", { connectionId, reason: "already_authenticated", userId: authenticatedUserId })
         ws.close(1008, "Already authenticated")
         return
       }
+      stage = "session_lookup"
       const session = await getSession(message.token)
       if (!session) {
+        logWarn("websocket.authentication_rejected", { connectionId, reason: "invalid_session" })
         ws.close(1008, "Invalid or expired session")
         return
       }
       clearTimeout(authenticationTimeout)
       socketSessions.set(ws, session.key)
       socketUsers.set(ws, session.user)
+      authenticatedUserId = session.user.id
       socketExpiryTimers.set(ws, setTimeout(() => ws.close(1008, "Session expired"), session.expiresAt - Date.now()))
       send(ws, { type: "authenticated", user: session.user })
+      logInfo("websocket.authenticated", { connectionId, userId: session.user.id })
       return
     }
     const sessionKey = socketSessions.get(ws)
@@ -169,18 +194,23 @@ wss.on("connection", (ws, request) => {
           Y.decodeStateVector(clientStateVector)
         }
       } catch {
+        logWarn("websocket.protocol_rejected", { connectionId, userId: authenticatedUser.id, reason: "invalid_state_vector" })
         send(ws, { type: "error", message: "Invalid Yjs state vector." })
         return
       }
 
       const roomId = message.roomId.trim()
       const userId = authenticatedUser.id
+      stage = "room_authorization"
       if (!userId || !await hasRoomAccess(roomId, userId)) {
+        logWarn("websocket.room_access_denied", { connectionId, userId, roomId })
         send(ws, { type: "error", message: "You are not authorized to join this room." })
         return
       }
+      stage = "room_lookup"
       const context = await getRoomPresenceContext(roomId)
       if (!context) {
+        logWarn("websocket.room_access_denied", { connectionId, userId, roomId, reason: "room_not_found" })
         send(ws, { type: "error", message: "The collaboration room no longer exists." })
         return
       }
@@ -193,11 +223,15 @@ wss.on("connection", (ws, request) => {
       }
       leaveRoom(ws)
       const room = rooms.get(roomId) ?? new Set<WebSocket>()
+      stage = "document_load"
       const doc = await getRoomDoc(roomId)
       room.add(ws)
       rooms.set(roomId, room)
       roomDocs.set(roomId, doc)
-      membership.set(ws, { roomId, userId, scopeKey })
+      membership.set(ws, { roomId, userId, scopeKey, projectId: context.projectId, fileId: context.fileId })
+      activeRoomId = roomId
+      activeProjectId = context.projectId
+      activeFileId = context.fileId
       const collaborator: Presence = {
         userId,
         username: authenticatedUser.username,
@@ -226,11 +260,19 @@ wss.on("connection", (ws, request) => {
       })
       broadcastPresence(scopeKey, { type: "presence-update", collaborator }, ws)
       broadcast(roomId, { type: "users", count: room.size }, ws)
+      logInfo("websocket.room_joined", { connectionId, userId, projectId: context.projectId, roomId, fileId: context.fileId })
       return
     }
 
     const member = membership.get(ws)
-    if (!member || (message.type === "doc-update" && message.roomId !== member.roomId)) return
+    if (!member) {
+      if (message.type !== "presence-update") logWarn("websocket.protocol_rejected", { connectionId, userId: authenticatedUser.id, reason: "room_not_joined" })
+      return
+    }
+    if (message.type === "doc-update" && message.roomId !== member.roomId) {
+      logWarn("websocket.protocol_rejected", { connectionId, userId: member.userId, roomId: member.roomId, reason: "room_mismatch" })
+      return
+    }
     if (message.type === "doc-update") {
       const doc = roomDocs.get(member.roomId)
       if (!doc) return
@@ -246,7 +288,10 @@ wss.on("connection", (ws, request) => {
         } finally {
           if (roomPersistenceQueues.get(member.roomId) === persisted) roomPersistenceQueues.delete(member.roomId)
         }
-      } catch {
+      } catch (error) {
+        logError(isDatabaseError(error) ? "database.websocket_operation_failed" : "websocket.document_update_failed", {
+          connectionId, userId: member.userId, projectId: member.projectId, roomId: member.roomId, fileId: member.fileId, operation: "persist_document_update", ...safeErrorFields(error),
+        })
         send(ws, { type: "error", message: "The document update could not be applied or saved." })
         return
       }
@@ -264,8 +309,16 @@ wss.on("connection", (ws, request) => {
         broadcastPresence(member.scopeKey, { type: "presence-update", collaborator }, ws)
       }
     }
+    } catch (error) {
+      logError(isDatabaseError(error) ? "database.websocket_operation_failed" : "websocket.message_failed", {
+        connectionId, userId: authenticatedUserId, projectId: activeProjectId, roomId: activeRoomId, fileId: activeFileId, operation: stage, ...safeErrorFields(error),
+      })
+      send(ws, { type: "error", message: "The server could not process this message." })
+    }
   })
   const cleanup = () => {
+    if (cleanedUp) return
+    cleanedUp = true
     clearTimeout(authenticationTimeout)
     const expiryTimer = socketExpiryTimers.get(ws)
     if (expiryTimer) clearTimeout(expiryTimer)
@@ -274,10 +327,27 @@ wss.on("connection", (ws, request) => {
     socketUsers.delete(ws)
     leaveRoom(ws)
   }
-  ws.on("close", cleanup)
-  ws.on("error", cleanup)
+  ws.on("close", (code, reason) => {
+    logInfo("websocket.connection_closed", {
+      connectionId,
+      userId: authenticatedUserId,
+      projectId: activeProjectId,
+      roomId: activeRoomId,
+      fileId: activeFileId,
+      closeCode: code,
+      reason: safeCloseReason(reason.toString()),
+      durationMs: Math.round(performance.now() - connectedAt),
+    })
+    cleanup()
+  })
+  ws.on("error", (error) => {
+    logError("websocket.connection_error", { connectionId, userId: authenticatedUserId, projectId: activeProjectId, roomId: activeRoomId, fileId: activeFileId, ...safeErrorFields(error) })
+    cleanup()
+  })
 })
 
+app.use(requestContext)
+app.use(httpRequestLogger)
 app.use(cors({ origin: allowedOrigins }))
 app.use(express.json({ limit: "1mb" }))
 app.use("/auth", authRoutes)
@@ -285,11 +355,15 @@ app.use("/rooms", roomRoutes)
 app.use("/projects", projectRoutes)
 app.use("/", executionRoutes)
 app.get("/", (_req, res) => res.send("CodeSync server is running."))
+app.get("/health", healthHandler)
+app.get("/ready", createReadinessHandler(() => prisma.$queryRaw`SELECT 1`))
+app.use(notFoundHandler)
+app.use(errorHandler)
 
 try {
   await prisma.$connect()
-  server.listen(port, () => console.log(`CodeSync server listening on port ${port}`))
+  server.listen(port, () => logInfo("server.started", { port }))
 } catch (error) {
-  console.error("CodeSync could not connect to PostgreSQL.", error)
+  logError("database.startup_failed", { dependency: "postgresql", ...safeErrorFields(error) })
   process.exitCode = 1
 }

@@ -4,6 +4,7 @@ import { prisma } from "../db/client.js"
 import { findUserByName } from "../auth/store.js"
 import { createProject, createProjectFile, getProjectRole, inviteProjectMember } from "../auth/projectStore.js"
 import { requireAuth } from "../auth/middleware.js"
+import { logWarn } from "../observability/logger.js"
 
 const router = Router()
 router.use(requireAuth)
@@ -32,7 +33,10 @@ router.get("/:projectId/files", async (req, res) => {
   const projectId = projectIdSchema.safeParse(req.params.projectId)
   if (!projectId.success) return res.status(400).json({ error: "Invalid project ID." })
   const role = await getProjectRole(projectId.data, res.locals.userId!)
-  if (!role) return res.status(404).json({ error: "Project not found." })
+  if (!role) {
+    logWarn("authorization.project_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
+    return res.status(404).json({ error: "Project not found." })
+  }
   const files = await prisma.file.findMany({ where: { projectId: projectId.data }, orderBy: { path: "asc" }, select: { id: true, projectId: true, path: true, content: true, roomId: true, createdAt: true, updatedAt: true } })
   res.json(files)
 })
@@ -43,7 +47,10 @@ router.post("/:projectId/files", async (req, res) => {
   if (!projectId.success || !body.success) return res.status(400).json({ error: "Invalid project ID or file path." })
   try {
     const file = await createProjectFile(projectId.data, res.locals.userId!, body.data.path)
-    if (!file) return res.status(404).json({ error: "Project not found or you do not have edit access." })
+    if (!file) {
+      logWarn("authorization.file_write_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
+      return res.status(404).json({ error: "Project not found or you do not have edit access." })
+    }
     res.status(201).json(file)
   } catch (error) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") return res.status(409).json({ error: "A file already exists at that path." })
@@ -57,7 +64,10 @@ router.patch("/:projectId/files/:fileId", async (req, res) => {
   const body = z.object({ path: filePathSchema }).strict().safeParse(req.body)
   if (!projectId.success || !fileId.success || !body.success) return res.status(400).json({ error: "Invalid project ID, file ID, or file path." })
   const role = await getProjectRole(projectId.data, res.locals.userId!)
-  if (role !== "OWNER" && role !== "EDITOR") return res.status(404).json({ error: "File not found or you do not have edit access." })
+  if (role !== "OWNER" && role !== "EDITOR") {
+    logWarn("authorization.file_write_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data, fileId: fileId.data })
+    return res.status(404).json({ error: "File not found or you do not have edit access." })
+  }
   try {
     const result = await prisma.file.updateMany({ where: { id: fileId.data, projectId: projectId.data }, data: { path: body.data.path } })
     if (!result.count) return res.status(404).json({ error: "File not found." })
@@ -74,7 +84,10 @@ router.delete("/:projectId/files/:fileId", async (req, res) => {
   const fileId = z.string().min(1).max(64).safeParse(req.params.fileId)
   if (!projectId.success || !fileId.success) return res.status(400).json({ error: "Invalid project ID or file ID." })
   const role = await getProjectRole(projectId.data, res.locals.userId!)
-  if (role !== "OWNER" && role !== "EDITOR") return res.status(404).json({ error: "File not found or you do not have edit access." })
+  if (role !== "OWNER" && role !== "EDITOR") {
+    logWarn("authorization.file_write_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data, fileId: fileId.data })
+    return res.status(404).json({ error: "File not found or you do not have edit access." })
+  }
   const file = await prisma.file.findFirst({ where: { id: fileId.data, projectId: projectId.data }, select: { roomId: true } })
   if (!file) return res.status(404).json({ error: "File not found." })
   if (file.roomId) await prisma.room.delete({ where: { id: file.roomId } })
@@ -88,7 +101,10 @@ router.post("/:projectId/invites", async (req, res) => {
   if (!projectId.success || !body.success) return res.status(400).json({ error: "Invalid project ID or username." })
   const user = await findUserByName(body.data.username)
   if (!user) return res.status(404).json({ error: "No account found for that username." })
-  if (!await inviteProjectMember(projectId.data, res.locals.userId!, user.id)) return res.status(403).json({ error: "Only the project owner can invite participants." })
+  if (!await inviteProjectMember(projectId.data, res.locals.userId!, user.id)) {
+    logWarn("authorization.project_invite_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
+    return res.status(403).json({ error: "Only the project owner can invite participants." })
+  }
   res.status(204).end()
 })
 

@@ -9,6 +9,7 @@ import { PrismaClient } from "@prisma/client"
 
 let port = 0
 let judgePort = 0
+const serverLogs: string[] = []
 const remoteOrigin = {}
 const prisma = new PrismaClient()
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
@@ -74,18 +75,26 @@ function startServer() {
     stdio: ["ignore", "pipe", "pipe"],
   })
   let output = ""
-  child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString() })
-  child.stderr.on("data", (chunk: Buffer) => { output += chunk.toString() })
+  child.stdout.on("data", (chunk: Buffer) => { const text = chunk.toString(); output += text; serverLogs.push(text) })
+  child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); output += text; serverLogs.push(text) })
   return { child, getOutput: () => output }
 }
 
 async function waitForServer(running: ReturnType<typeof startServer>) {
+  const hasStarted = () => running.getOutput().split(/\r?\n/).some((line) => {
+    try {
+      const entry = JSON.parse(line) as { event?: string; port?: number }
+      return entry.event === "server.started" && entry.port === port
+    } catch {
+      return false
+    }
+  })
   const deadline = Date.now() + 15_000
-  while (!running.getOutput().includes(`listening on port ${port}`) && Date.now() < deadline) {
+  while (!hasStarted() && Date.now() < deadline) {
     if (running.child.exitCode !== null) throw new Error(`Server exited before startup: ${running.getOutput()}`)
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
-  assert.ok(running.getOutput().includes(`listening on port ${port}`), `server should start: ${running.getOutput()}`)
+  assert.ok(hasStarted(), `server should start: ${running.getOutput()}`)
 }
 
 async function stopServer(child: ReturnType<typeof spawn>) {
@@ -182,6 +191,27 @@ async function assertSocketRoomDenied(token: string, roomId: string) {
   ws.close()
 }
 
+async function assertSocketRejectsInvalidSession() {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`)
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve)
+    ws.once("error", reject)
+  })
+  const closed = new Promise<number>((resolve) => ws.once("close", (code) => resolve(code)))
+  ws.send(JSON.stringify({ type: "authenticate", token: "x".repeat(48) }))
+  assert.equal(await closed, 1008, "invalid socket sessions are closed with policy code")
+}
+
+async function assertSocketRejectsOrigin() {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`, { origin: "https://untrusted.example" })
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve)
+    ws.once("error", reject)
+  })
+  const closed = new Promise<number>((resolve) => ws.once("close", (code) => resolve(code)))
+  assert.equal(await closed, 1008, "disallowed origins are rejected")
+}
+
 test("PostgreSQL auth and room data persist while Yjs collaboration converges", { timeout: 60_000 }, async (t) => {
   port = await availablePort()
   judgePort = await availablePort()
@@ -231,6 +261,15 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
     await prisma.$disconnect()
   })
   await waitForServer(running)
+
+  const healthResponse = await api("/health")
+  assert.equal(healthResponse.status, 200)
+  assert.deepEqual(await healthResponse.json(), { status: "ok" })
+  assert.match(healthResponse.headers.get("x-request-id") ?? "", /^[0-9a-f-]{36}$/i)
+  const suppliedRequestId = "b8fe3a51-cf0f-4ee1-9dde-24f8e8baf710"
+  const suppliedIdResponse = await fetch(`http://127.0.0.1:${port}/health`, { headers: { "X-Request-ID": suppliedRequestId } })
+  assert.equal(suppliedIdResponse.headers.get("x-request-id"), suppliedRequestId)
+  assert.equal((await api("/ready")).status, 200, "readiness succeeds while PostgreSQL is available")
 
   const ownerName = `${prefix}owner`
   const guestName = `${prefix}guest`
@@ -301,6 +340,8 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.equal((await api(`/rooms/${sharedRoom}/access`, guestAuth.token, {})).status, 200)
   assert.equal((await api(`/rooms/${isolatedRoom}/access`, outsiderAuth.token, {})).status, 201)
   await assertSocketRequiresAuthentication()
+  await assertSocketRejectsInvalidSession()
+  await assertSocketRejectsOrigin()
   await assertSocketRoomDenied(outsiderAuth.token, sharedRoom)
 
   const firstDoc = new Y.Doc()
@@ -554,4 +595,12 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
     rateLimited = response.status === 429
   }
   assert.equal(rateLimited, true, "authentication is rate limited by IP")
+  await waitFor(() => serverLogs.join("").includes('"event":"execution.failed"'))
+  const capturedLogs = serverLogs.join("")
+  for (const event of ["http.request", "auth.request_rejected", "authorization.project_denied", "websocket.connection_accepted", "websocket.connection_rejected", "websocket.authentication_rejected", "websocket.room_access_denied", "websocket.connection_closed", "execution.requested", "execution.completed", "execution.failed", "execution.rate_limited"]) {
+    assert.ok(capturedLogs.includes(`"event":"${event}"`), `server logs should include ${event}`)
+  }
+  for (const secret of [ownerAuth.token, guestAuth.token, outsiderAuth.token, logoutAuth.token, "test-password-123", "print(1)", "execution-alpha", "execution-beta", "__poll_failure__", "source_code"]) {
+    assert.ok(!capturedLogs.includes(secret), "server logs must not contain passwords, session tokens, or code")
+  }
 })

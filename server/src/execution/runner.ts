@@ -15,7 +15,7 @@ const judgeResultSchema = z.object({
 })
 
 export class ExecutionFailure extends Error {
-  constructor(readonly status: "timeout" | "service_error", message: string) {
+  constructor(readonly status: "timeout" | "service_error", message: string, readonly stage = "service") {
     super(message)
   }
 }
@@ -74,8 +74,9 @@ export async function executeCode(input: ExecutionInput, options: RunnerOptions 
   const fetcher = options.fetcher ?? fetch
 
   const request = async (path: string, init?: RequestInit): Promise<Response> => {
+    const stage = path.startsWith("/submissions?") ? "submission" : "polling"
     const remaining = deadline - performance.now()
-    if (remaining <= 0) throw new ExecutionFailure("timeout", "Execution service did not respond in time.")
+    if (remaining <= 0) throw new ExecutionFailure("timeout", "Execution service did not respond in time.", stage)
     const headers = new Headers(init?.headers)
     headers.set("Content-Type", "application/json")
     const authToken = options.authToken ?? process.env.JUDGE0_AUTH_TOKEN
@@ -84,9 +85,9 @@ export async function executeCode(input: ExecutionInput, options: RunnerOptions 
       return await fetcher(`${apiUrl}${path}`, { ...init, headers, signal: AbortSignal.timeout(Math.max(1, Math.ceil(remaining))) })
     } catch (error) {
       if (performance.now() >= deadline || (error instanceof Error && error.name === "TimeoutError")) {
-        throw new ExecutionFailure("timeout", "Execution service did not respond in time.")
+        throw new ExecutionFailure("timeout", "Execution service did not respond in time.", stage)
       }
-      throw new ExecutionFailure("service_error", "Execution service is unavailable. Check the server connection and Judge0 configuration.")
+      throw new ExecutionFailure("service_error", "Execution service is unavailable. Check the server connection and Judge0 configuration.", stage)
     }
   }
 
@@ -94,16 +95,17 @@ export async function executeCode(input: ExecutionInput, options: RunnerOptions 
     if (!response.ok) {
       throw new ExecutionFailure("service_error", response.status === 503
         ? "Execution service is temporarily unavailable."
-        : "Execution service returned an error.")
+        : "Execution service returned an error.", includeToken ? "submission" : "polling")
     }
     let body: unknown
     try {
       body = await boundedJson(response)
     } catch (error) {
       if (performance.now() >= deadline || (error instanceof Error && error.name === "TimeoutError")) {
-        throw new ExecutionFailure("timeout", "Execution service did not respond in time.")
+        throw new ExecutionFailure("timeout", "Execution service did not respond in time.", includeToken ? "submission" : "polling")
       }
-      throw error
+      if (error instanceof ExecutionFailure) throw new ExecutionFailure(error.status, error.message, includeToken ? "submission" : "polling")
+      throw new ExecutionFailure("service_error", "Execution service returned an invalid response.", includeToken ? "submission" : "polling")
     }
     const parsed = judgeResultSchema.safeParse(body)
     if (!parsed.success || (includeToken && !parsed.data.token) || (!includeToken && !parsed.data.status)) {
@@ -134,7 +136,7 @@ export async function executeCode(input: ExecutionInput, options: RunnerOptions 
   let result = submission
   while (!result.status || result.status.id <= 2) {
     const remaining = deadline - performance.now()
-    if (remaining <= 0) throw new ExecutionFailure("timeout", "Execution timed out while waiting for the sandbox.")
+    if (remaining <= 0) throw new ExecutionFailure("timeout", "Execution timed out while waiting for the sandbox.", "polling")
     await new Promise((resolve) => setTimeout(resolve, Math.min(options.pollIntervalMs ?? 400, remaining)))
     const token = submission.token!
     result = await readResult(await request(`/submissions/${encodeURIComponent(token)}?base64_encoded=false&fields=stdout,stderr,compile_output,time,status`), false)
@@ -142,7 +144,7 @@ export async function executeCode(input: ExecutionInput, options: RunnerOptions 
 
   const statusId = result.status.id
   if (statusId === 13 || ![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14].includes(statusId)) {
-    throw new ExecutionFailure("service_error", "Execution service could not complete the request.")
+    throw new ExecutionFailure("service_error", "Execution service could not complete the request.", "result")
   }
   const status: CodeExecutionResponse["status"] = statusId === 3 ? "accepted"
     : statusId === 5 ? "timeout"

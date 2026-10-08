@@ -6,6 +6,7 @@ import { codeSchema } from "../validators/execution.validator.js"
 import { runCode } from "../controllers/execution.controller.js"
 import { requireAuth } from "../auth/middleware.js"
 import { languageOptions } from "../execution/languages.js"
+import { logWarn } from "../observability/logger.js"
 
 const router = Router()
 const requests = new Map<string, { count: number; resetAt: number }>()
@@ -23,6 +24,7 @@ const limitExecution = (req: Request, res: Response, next: NextFunction) => {
     return
   }
   if (current.count >= 10) {
+    logWarn("execution.rate_limited", { requestId: res.locals.requestId, userId: res.locals.userId, reason: "user_minute_limit" })
     res.status(429).json({ error: "Execution limit reached. Try again in a minute." })
     return
   }
@@ -33,6 +35,7 @@ const limitExecution = (req: Request, res: Response, next: NextFunction) => {
 const validate = (schema: ZodTypeAny) => (req: Request, res: Response, next: NextFunction) => {
   const result = schema.safeParse(req.body)
   if (!result.success) {
+    logWarn("execution.validation_rejected", { requestId: res.locals.requestId, userId: res.locals.userId, reason: "invalid_request" })
     return res.status(400).json({ status: "validation_error", error: "Invalid code execution request.", details: result.error.format() })
   }
   req.body = result.data

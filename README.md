@@ -535,13 +535,25 @@ Foreign keys cascade when an owner or parent record is removed. Indexes cover se
 ### Health Check
 
 ```http
-GET /
+GET /health
+GET /ready
 ```
+
+`/health` reports that the server process is alive. `/ready` checks PostgreSQL through Prisma and returns `200` when ready or `503` when the database check fails. Neither endpoint exposes configuration or dependency error details. The existing `GET /` informational response remains available.
+
+## 🔎 Operational Diagnostics
+
+The server writes one-line JSON records to standard output with a timestamp, level (`info`, `warn`, or `error`), event name, and only explicitly selected context fields. HTTP responses include `X-Request-ID`; valid UUID v4 values supplied by a caller are reused, and other values are replaced with a server-generated ID. Share that response header when reporting an HTTP problem so the matching `http.request` or error event can be found.
+
+Useful events include HTTP request completion, authentication and authorization rejection, WebSocket lifecycle and protocol failures, execution lifecycle/failure stages, database readiness failures, and unexpected request errors. Successful `/health` and `/ready` probes are omitted from request logs to reduce noise.
+
+Logs intentionally exclude passwords, session tokens, cookies, authorization headers, database URLs, Judge0 credentials, request bodies, source code, and Yjs document/update payloads. WebSocket cursor and presence traffic is not logged individually. These diagnostics are application logs only; CodeSync does not include an external monitoring or tracing service.
 
 Response:
 
 ```text
-CodeSync server is running.
+GET /health  -> 200 { "status": "ok" }
+GET /ready   -> 200 { "status": "ready" }
 ```
 
 ### Authentication
