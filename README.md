@@ -86,7 +86,7 @@ Open the application in two browser tabs, join the same room, and start editing.
 ```text
 User A
   │
-  │ code-update
+  │ doc-update (Yjs)
   ▼
 WebSocket Server
   │
@@ -139,25 +139,29 @@ Current room state returned
 Collaborative editing begins
 ```
 
+CodeSync uses Yjs shared text and its Monaco binding. Editors exchange incremental document updates over the existing WebSocket room connection. Yjs merges concurrent edits; the server applies each update to the room document and relays it to the other participants.
+
+When a client joins, it sends a Yjs state vector. The server responds with the missing document update and its current state vector, allowing the client to reconcile offline edits after a reconnect.
+
 When code changes:
 
 ```text
-Monaco Editor
+Monaco Editor + Yjs binding
      ↓
-300 ms debounce
+incremental Yjs update
      ↓
-code-update
+doc-update
      ↓
 WebSocket server
      ↓
-save latest room document
+apply update to the room Y.Doc
      ↓
 broadcast to other users
 ```
 
 Cursor movement follows a similar WebSocket event flow.
 
-Remote code updates are applied to Monaco without sending the same update back to the server, preventing an unnecessary update loop.
+Remote code updates are applied to the shared Yjs document without echoing them back to the server.
 
 ### Room State
 
@@ -185,9 +189,9 @@ WebSocket → realtime collaboration
 HTTP      → code execution
 ```
 
-### Why Full-Document Synchronization?
+### Why Yjs?
 
-CodeSync intentionally uses a simple last-update-wins model.
+Yjs provides conflict-free merging for concurrent text edits and compact incremental updates. It keeps client documents reconcilable after temporary disconnects while using the existing WebSocket transport.
 
 This keeps the system small and understandable while demonstrating the fundamentals of:
 
@@ -271,7 +275,16 @@ Stronger execution isolation
 
 ## 🧪 Verification
 
-The project was tested locally and against the deployed production services.
+Run the local collaboration integration test with:
+
+```bash
+cd server
+npm test
+```
+
+It checks concurrent edits, late joins, room isolation, cursor events, disconnect cleanup, and reconnect reconciliation. It reports loopback update latency for one local run; those measurements are indicative and are not a load test.
+
+Other deployment and Judge0 checks below reflect prior project verification and are not part of this collaboration integration test.
 
 Verified functionality includes:
 
@@ -280,7 +293,7 @@ Verified functionality includes:
 - WebSocket connection establishment
 - room joining
 - participant counts
-- realtime code synchronization
+- concurrent Yjs code synchronization
 - cursor synchronization
 - room isolation
 - late-join code snapshots
@@ -289,7 +302,7 @@ Verified functionality includes:
 - Judge0 code execution
 - production `/run` API
 - production frontend/backend communication
-- dependency security audit
+- local collaboration integration test
 
 The production frontend is deployed on Vercel and the backend on Render.
 
@@ -303,6 +316,8 @@ The production frontend is deployed on Vercel and the backend on Render.
 - TypeScript
 - Vite
 - Monaco Editor
+- Yjs
+- `y-monaco`
 
 ### Backend
 
@@ -485,14 +500,15 @@ The server validates the request and submits it to Judge0.
 The collaboration protocol uses a small set of events:
 
 ```text
-join
-code-update
+join (includes Yjs state vector)
+joined (includes Yjs update and state vector)
+doc-update (incremental Yjs update)
 cursor-update
-users
+users (participant count)
 user-left
 ```
 
-The server also sends the latest room document to newly joined users so they can immediately synchronize with the existing session.
+The server returns the update missing from the joining client's state vector. Room documents are held in memory and are deleted when the last participant leaves.
 
 ---
 
@@ -502,13 +518,7 @@ CodeSync intentionally keeps the architecture simple.
 
 ### Collaboration
 
-The current synchronization model is:
-
-```text
-last received full-document update wins
-```
-
-Therefore, simultaneous edits to overlapping text can overwrite each other.
+Yjs merges concurrent text edits. Room documents remain in process memory; they are not persisted after the last participant leaves or a server restart.
 
 ### Persistence
 
@@ -540,7 +550,7 @@ Code execution depends on the configured external Judge0 service and its availab
 Current
   │
   ├── In-memory rooms
-  ├── Last-write-wins synchronization
+  ├── Yjs conflict-free synchronization
   ├── No authentication
   └── Single server instance
         │
@@ -556,7 +566,7 @@ Next
         ▼
 Future
   │
-  ├── Conflict-free collaboration
+  ├── Persistent room history
   ├── Redis-based distributed presence
   ├── Multi-instance WebSocket scaling
   ├── Persistent project/workspace storage
@@ -571,7 +581,7 @@ CodeSync demonstrates practical understanding of:
 
 - WebSocket communication
 - event-driven server architecture
-- realtime state synchronization
+- CRDT-based realtime state synchronization
 - connection lifecycle management
 - room-based session management
 - Monaco Editor integration

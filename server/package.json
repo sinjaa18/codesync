@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx --watch src/index.ts",
     "build": "tsc",
+    "test": "npm run test:typecheck && tsx --test test/collaboration.test.ts",
+    "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
     "start": "node --env-file-if-exists=.env dist/index.js"
   },
   "keywords": [],
@@ -16,6 +18,7 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "ws": "^8.19.0",
+    "yjs": "^13.6.33",
     "zod": "^4.3.6"
   },
   "devDependencies": {

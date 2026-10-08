@@ -2,12 +2,13 @@ export type JoinMessage={
   type:"join"
   roomId:string
   userId:string
+  stateVector?:string
 }
 
-export type CodeUpdateMessage={
-  type:"code-update"
+export type DocumentUpdateMessage={
+  type:"doc-update"
   roomId:string
-  changes:string
+  update:string
   userId:string
 }
 
@@ -21,5 +22,5 @@ export type CursorUpdateMessage={
 
 export type WSMessage=
 | JoinMessage
-| CodeUpdateMessage
+| DocumentUpdateMessage
 | CursorUpdateMessage

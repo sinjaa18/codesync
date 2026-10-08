@@ -9,6 +9,9 @@
 
     /* Bundler mode */
     "moduleResolution": "bundler",
+    "paths": {
+      "monaco-editor/esm/vs/editor/editor.api.js": ["./node_modules/monaco-editor/esm/vs/editor/editor.api.d.ts"]
+    },
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",

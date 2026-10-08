@@ -1,19 +1,34 @@
 import { useEffect, useRef, useState } from "react"
+import * as Y from "yjs"
 import CodeEditor from "./components/CodeEditor"
 
 const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:5000"
 const wsUrl = import.meta.env.VITE_WS_URL || apiUrl.replace(/^http/, "ws")
+const remoteOrigin = {}
 type ConnectionStatus = "disconnected" | "connecting" | "connected"
 type ServerMessage = {
   type: string
   message?: string
   roomId?: string
-  code?: string
+  update?: string
+  stateVector?: string
   count?: number
   userId?: string
-  changes?: string
   line?: number
   column?: number
+}
+
+function encodeBase64(bytes: Uint8Array) {
+  let binary = ""
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32_768))
+  }
+  return btoa(binary)
+}
+
+function decodeBase64(value: string) {
+  const binary = atob(value)
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0))
 }
 
 export default function App() {
@@ -23,15 +38,34 @@ export default function App() {
   const [error, setError] = useState("")
   const [output, setOutput] = useState("")
   const [language, setLanguage] = useState("javascript")
-  const [code, setCode] = useState("console.log('Hello from CodeSync')")
+  const [doc, setDoc] = useState(() => new Y.Doc())
   const [remoteCursor, setRemoteCursor] = useState<{ line: number; column: number } | null>(null)
   const [userCount, setUserCount] = useState(0)
   const wsRef = useRef<WebSocket | null>(null)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const userIdRef = useRef(crypto.randomUUID())
-  const lastRemoteCodeRef = useRef<string | null>(null)
+  const docRef = useRef(doc)
+  const activeRoomRef = useRef<string | null>(null)
   const lastCursorRef = useRef("")
   const remoteCursorUserRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    const sendUpdate = (update: Uint8Array, origin: unknown) => {
+      const ws = wsRef.current
+      const activeRoom = activeRoomRef.current
+      if (origin === remoteOrigin || !activeRoom || ws?.readyState !== WebSocket.OPEN) return
+      ws.send(JSON.stringify({
+        type: "doc-update",
+        roomId: activeRoom,
+        userId: userIdRef.current,
+        update: encodeBase64(update),
+      }))
+    }
+    doc.on("update", sendUpdate)
+    return () => {
+      doc.off("update", sendUpdate)
+      doc.destroy()
+    }
+  }, [doc])
 
   const connect = (targetRoom = roomId) => {
     const normalizedRoom = targetRoom.trim()
@@ -44,7 +78,12 @@ export default function App() {
     setStatus("connecting")
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
-    ws.onopen = () => ws.send(JSON.stringify({ type: "join", roomId: normalizedRoom, userId: userIdRef.current }))
+    ws.onopen = () => ws.send(JSON.stringify({
+      type: "join",
+      roomId: normalizedRoom,
+      userId: userIdRef.current,
+      stateVector: encodeBase64(Y.encodeStateVector(docRef.current)),
+    }))
     ws.onmessage = (event: MessageEvent<string>) => {
       let data: ServerMessage
       try {
@@ -60,9 +99,26 @@ export default function App() {
         return
       }
       if (data.type === "joined") {
+        try {
+          const currentDoc = docRef.current
+          Y.applyUpdate(currentDoc, decodeBase64(data.update ?? ""), remoteOrigin)
+          const missing = Y.encodeStateAsUpdate(currentDoc, decodeBase64(data.stateVector ?? ""))
+          if (missing.length > 2 && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "doc-update",
+              roomId: normalizedRoom,
+              userId: userIdRef.current,
+              update: encodeBase64(missing),
+            }))
+          }
+        } catch {
+          setError("The server sent an invalid collaboration state.")
+          setStatus("disconnected")
+          ws.close()
+          return
+        }
+        activeRoomRef.current = normalizedRoom
         setRoomId(normalizedRoom)
-        setCode(data.code ?? "")
-        lastRemoteCodeRef.current = data.code ?? ""
         setUserCount(data.count ?? 1)
         setStatus("connected")
         setJoined(true)
@@ -76,9 +132,16 @@ export default function App() {
         setRemoteCursor(null)
         remoteCursorUserRef.current = null
       }
-      if (data.type === "code-update" && typeof data.changes === "string") {
-        lastRemoteCodeRef.current = data.changes
-        setCode(data.changes)
+      if (data.type === "code-update") {
+        setError("The server is using an outdated collaboration protocol. Refresh the application.")
+        ws.close()
+      }
+      if (data.type === "doc-update" && typeof data.update === "string") {
+        try {
+          Y.applyUpdate(docRef.current, decodeBase64(data.update), remoteOrigin)
+        } catch {
+          setError("The server sent an invalid document update.")
+        }
       }
       if (data.type === "cursor-update" && Number.isInteger(data.line) && Number.isInteger(data.column)) {
         setRemoteCursor({ line: data.line!, column: data.column! })
@@ -90,24 +153,11 @@ export default function App() {
       if (wsRef.current !== ws) return
       setStatus("disconnected")
       setUserCount(0)
+      activeRoomRef.current = null
       setRemoteCursor(null)
       setError((current) => current || "Connection closed. Reconnect to continue collaborating.")
     }
   }
-
-  useEffect(() => {
-    if (!joined || status !== "connected" || code === lastRemoteCodeRef.current) return
-    if (timerRef.current) clearTimeout(timerRef.current)
-    const room = roomId
-    const content = code
-    timerRef.current = setTimeout(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "code-update", roomId: room, userId: userIdRef.current, changes: content }))
-        lastRemoteCodeRef.current = content
-      }
-    }, 300)
-    return () => { if (timerRef.current) clearTimeout(timerRef.current) }
-  }, [code, joined, roomId, status])
 
   const updateCursor = (line: number, column: number) => {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
@@ -120,16 +170,17 @@ export default function App() {
   const leaveRoom = () => {
     wsRef.current?.close()
     wsRef.current = null
-    if (timerRef.current) clearTimeout(timerRef.current)
+    activeRoomRef.current = null
+    const emptyDoc = new Y.Doc()
+    docRef.current = emptyDoc
+    setDoc(emptyDoc)
     setJoined(false)
     setStatus("disconnected")
     setUserCount(0)
-    setCode("")
     setOutput("")
     setRemoteCursor(null)
     remoteCursorUserRef.current = null
     setError("")
-    lastRemoteCodeRef.current = null
   }
 
   const runCode = async () => {
@@ -139,7 +190,7 @@ export default function App() {
       const response = await fetch(`${apiUrl}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, language }),
+        body: JSON.stringify({ code: docRef.current.getText("code").toString(), language }),
       })
       const raw: unknown = await response.json()
       if (!raw || typeof raw !== "object") throw new Error("The server sent an invalid response.")
@@ -194,7 +245,7 @@ export default function App() {
     </header>
     {error && <div className="notice" role="status">{error}<button aria-label="Dismiss" onClick={() => setError("")}>×</button></div>}
     <section className="workspace">
-      <div className="editor-container"><CodeEditor value={code} language={language} remoteCursor={remoteCursor} onChange={setCode} onCursorMove={updateCursor} /></div>
+      <div className="editor-container"><CodeEditor doc={doc} language={language} remoteCursor={remoteCursor} onCursorMove={updateCursor} /></div>
       <aside className="output-container"><div className="output-title">Output</div><pre>{output || "Run your code to see output here."}</pre></aside>
     </section>
   </main>
