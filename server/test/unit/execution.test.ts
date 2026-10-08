@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { executeCode, ExecutionFailure } from "../src/execution/runner.js"
+import { executeCode, ExecutionFailure } from "../../src/execution/runner.js"
 
 const input = { code: "print('hello')", language: "python" as const, stdin: "" }
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } })
@@ -82,4 +82,20 @@ test("execution rejects malformed and oversized service responses", async () => 
     apiUrl: "http://judge0.test",
     fetcher: async () => new Response("x".repeat(128 * 1024 + 1)),
   }), (error: unknown) => error instanceof ExecutionFailure && error.status === "service_error")
+})
+
+test("execution truncates output at the documented boundary", async () => {
+  let calls = 0
+  const result = await executeCode(input, {
+    apiUrl: "http://judge0.test",
+    pollIntervalMs: 0,
+    fetcher: async () => {
+      calls += 1
+      return calls === 1
+        ? json({ token: "submission-1" })
+        : json({ stdout: "o".repeat(16_001), stderr: null, compile_output: null, time: null, status: { id: 3, description: "Accepted" } })
+    },
+  })
+  assert.equal(result.stdout.length, 16_000)
+  assert.equal(result.outputTruncated, true)
 })

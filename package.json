@@ -1,0 +1,13 @@
+{
+  "name": "codesync",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "npm --prefix server test",
+    "test:unit": "npm --prefix server run test:unit",
+    "test:integration": "npm --prefix server run test:integration",
+    "build": "npm --prefix server run build && npm --prefix client run build",
+    "lint": "npm --prefix client run lint",
+    "typecheck": "npm --prefix server run typecheck && npm --prefix server run test:typecheck"
+  }
+}

@@ -280,18 +280,49 @@ Stronger execution isolation
 
 ## 🧪 Verification
 
-Run the local collaboration integration test with:
+### Test database setup
 
-```bash
-cd server
-npm test
+The complete test suite resets a **dedicated local PostgreSQL database** before integration tests. It will refuse to reset a database unless its name is exactly `codesync_test` and its host is `localhost`, `127.0.0.1`, or `::1`. Never point this URL at your development or production database.
+
+Create the dedicated database using your local PostgreSQL administrator account. For the `postgres` role used by the test URL template:
+
+```sql
+CREATE DATABASE codesync_test OWNER postgres;
 ```
 
-The test requires `DATABASE_URL` to point to a migrated PostgreSQL database. It creates uniquely named test data and deletes its test users afterward.
+Copy `server/.env.test.local.example` to `server/.env.test.local` and set the local password in that ignored file. Do not put the test URL in `server/.env`; that file is for application development settings. Test scripts load `.env.test.local` specifically, while the integration server keeps the test database URL inherited from the test process.
 
-It checks signup, duplicate signup, invalid login, protected endpoints, room and project invitations, file creation/rename/deletion, path validation, outsider denial, per-file isolation, three-user presence and cursors, identity spoofing, active-file switching, disconnect/reconnect cleanup, concurrent edits, late joins, logout revocation, and restart recovery. On the local Windows/PostgreSQL 18 run, 10 sequential loopback Yjs updates measured p50 6.19 ms and p95 9.31 ms. This small sample is not a load test.
+```powershell
+Copy-Item server/.env.test.local.example server/.env.test.local
+# Edit server/.env.test.local and replace the password placeholder.
+```
 
-The execution runner tests use a local mocked Judge0 response and do not require the public service. They cover resource settings, output normalization, deadline enforcement, common result statuses, and malformed or oversized service responses. The integration test covers the authenticated API boundary.
+The test command drops and recreates the schema in that one local database, then applies the checked-in Prisma migrations. The database user must own the database. If PostgreSQL is unavailable or the URL is missing, tests stop with an actionable error; integration tests are never silently skipped.
+
+### Test commands
+
+Run from the repository root:
+
+```bash
+npm run test:unit
+npm run test:integration
+npm test
+npm run typecheck
+npm run build
+npm run lint
+```
+
+`npm test` runs type checks, unit tests, resets the test database, applies migrations, and runs the PostgreSQL/WebSocket integration suite. `npm run test:integration` resets the same dedicated database before running integration tests. Unit tests do not need PostgreSQL. The integration test starts a local CodeSync server and WebSocket clients on temporary loopback ports. It uses a local HTTP Judge0 mock; no public Judge0 access or credentials are needed.
+
+To remove the test database when finished, connect as a PostgreSQL administrator and run:
+
+```sql
+DROP DATABASE codesync_test;
+```
+
+The integration suite covers signup/login/session revocation, project membership and file authorization, lifecycle and isolation, three-client WebSocket presence, cursors, concurrent Yjs updates, late join and reconnect state, execution validation/failures/rate limits/result isolation, and PostgreSQL-backed restart recovery. It records a small local Yjs synchronization latency sample as diagnostic output; it is not a scalability benchmark.
+
+The execution unit tests use injected Judge0 responses and cover resource settings, output normalization/truncation, the submission and polling deadline, status mapping, and malformed or oversized responses. Integration tests exercise the authenticated API with the local mock.
 
 Verified functionality includes:
 
@@ -307,9 +338,8 @@ Verified functionality includes:
 - malformed and invalid room messages
 - disconnect cleanup
 - bounded Judge0 runner behavior with mocked service responses
-- production `/run` API
-- production frontend/backend communication
-- local collaboration integration test
+- local authenticated `/run` API against the Judge0 mock
+- PostgreSQL/WebSocket integration suite (when run with the documented local test database)
 
 The production frontend is deployed on Vercel and the backend on Render. The authentication changes in this repository have not been deployed; the public deployment remains on its prior version until these changes are released there.
 

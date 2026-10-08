@@ -7,8 +7,8 @@ import * as Y from "yjs"
 import WebSocket from "ws"
 import { PrismaClient } from "@prisma/client"
 
-const port = 20_000 + Math.floor(Math.random() * 20_000)
-const judgePort = 40_000 + Math.floor(Math.random() * 20_000)
+let port = 0
+let judgePort = 0
 const remoteOrigin = {}
 const prisma = new PrismaClient()
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
@@ -53,6 +53,19 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
 }
 
 type Peer = { ws: WebSocket; doc: Y.Doc; roomId: string; sendUpdate: (update: Uint8Array) => void }
+
+async function availablePort() {
+  const probe = createServer()
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject)
+    probe.listen(0, "127.0.0.1", resolve)
+  })
+  const address = probe.address()
+  assert.ok(address && typeof address !== "string")
+  const available = address.port
+  await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()))
+  return available
+}
 
 function startServer() {
   const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
@@ -170,6 +183,8 @@ async function assertSocketRoomDenied(token: string, roomId: string) {
 }
 
 test("PostgreSQL auth and room data persist while Yjs collaboration converges", { timeout: 60_000 }, async (t) => {
+  port = await availablePort()
+  judgePort = await availablePort()
   const prefix = `phase3-${randomUUID().slice(0, 8)}-`
   const sharedRoom = `${prefix}shared`
   const isolatedRoom = `${prefix}isolated`
@@ -180,6 +195,10 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
       let body = ""
       for await (const chunk of req) body += chunk.toString()
       const parsed = JSON.parse(body) as Record<string, unknown>
+      if (parsed.source_code === "__submit_failure__") {
+        res.writeHead(503).end("unavailable")
+        return
+      }
       const token = `mock-${++nextSubmission}`
       judgeSubmissions.set(token, parsed)
       res.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify({ token }))
@@ -187,12 +206,18 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
     }
     const token = req.url?.split("/")[2]?.split("?")[0]
     const submission = token ? judgeSubmissions.get(token) : undefined
+    if (submission?.source_code === "__poll_failure__") {
+      res.writeHead(502).end("upstream error")
+      return
+    }
+    const code = String(submission?.source_code ?? "")
+    const resultStatus = code === "__compile_error__" ? 6 : code === "__runtime_error__" ? 11 : code === "__timeout__" ? 5 : 3
     res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
-      stdout: `mock output: ${String(submission?.source_code ?? "")}`,
-      stderr: null,
-      compile_output: null,
+      stdout: resultStatus === 3 ? `mock output: ${code}` : null,
+      stderr: resultStatus === 11 ? "mock runtime error" : null,
+      compile_output: resultStatus === 6 ? "mock compiler error" : null,
       time: "0.012",
-      status: { id: 3, description: "Accepted" },
+      status: { id: resultStatus, description: "Mock result" },
     }))
   })
   await new Promise<void>((resolve) => judge.listen(judgePort, "127.0.0.1", resolve))
@@ -210,12 +235,15 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const ownerName = `${prefix}owner`
   const guestName = `${prefix}guest`
   const outsiderName = `${prefix}outsider`
+  assert.equal((await api("/auth/signup", undefined, { username: "x", password: "short" })).status, 400, "invalid signup input is rejected")
+  assert.equal((await api("/auth/login", undefined, { username: `${prefix}missing`, password: "incorrect-password" })).status, 401, "unknown accounts cannot log in")
   const ownerAuth = await signup(ownerName)
   const duplicate = await api("/auth/signup", undefined, { username: ownerName.toUpperCase(), password: "test-password-123" })
   assert.equal(duplicate.status, 409, "duplicate usernames are rejected case-insensitively")
   const invalidLogin = await api("/auth/login", undefined, { username: ownerName, password: "incorrect-password" })
   assert.equal(invalidLogin.status, 401, "invalid credentials are rejected")
   assert.equal((await api("/auth/me")).status, 401, "protected endpoints reject anonymous requests")
+  assert.equal((await api("/auth/me", "a".repeat(48))).status, 401, "unknown sessions are rejected")
   assert.equal((await api("/run", undefined, { code: "", language: "javascript" })).status, 401, "execution requires authentication")
   const languageResponse = await api("/run/languages")
   assert.deepEqual(await languageResponse.json(), [
@@ -246,8 +274,26 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.equal(submitted.enable_network, false)
   assert.equal(submitted.cpu_time_limit, 3)
   assert.equal(submitted.language_id, 71)
+  assert.equal((await api("/run", ownerToken, { code: "print(1)", language: "rust" })).status, 400, "unsupported languages are rejected")
+  assert.equal((await api("/run", ownerToken, { code: "print(1)", language: "python", stdin: "x".repeat(10_001) })).status, 400, "oversized standard input is rejected")
+  for (const [source, expected] of [["__compile_error__", "compilation_error"], ["__runtime_error__", "runtime_error"], ["__timeout__", "timeout"]] as const) {
+    const response = await api("/run", ownerToken, { code: source, language: "python" })
+    assert.equal(response.status, 200)
+    assert.equal((await response.json() as { status: string }).status, expected)
+  }
+  assert.equal((await api("/run", ownerToken, { code: "__submit_failure__", language: "python" })).status, 502, "Judge0 submission errors are normalized")
+  assert.equal((await api("/run", ownerToken, { code: "__poll_failure__", language: "python" })).status, 502, "Judge0 polling errors are normalized")
+  const simultaneous = await Promise.all(["execution-alpha", "execution-beta"].map((code) => api("/run", ownerToken, { code, language: "javascript" })))
+  const simultaneousResults = await Promise.all(simultaneous.map((response) => response.json() as Promise<{ stdout: string }>))
+  assert.deepEqual(simultaneousResults.map(({ stdout }) => stdout), ["mock output: execution-alpha", "mock output: execution-beta"], "parallel submissions retain their own results")
   const guestAuth = await signup(guestName)
   const outsiderAuth = await signup(outsiderName)
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const response = await api("/run", guestAuth.token, { code: `rate-limit-${attempt}`, language: "javascript" })
+    assert.equal(response.status, 200, `execution ${attempt + 1} is within the per-user limit`)
+    await response.arrayBuffer()
+  }
+  assert.equal((await api("/run", guestAuth.token, { code: "rate-limit-over", language: "javascript" })).status, 429, "execution rate limit blocks the eleventh request")
   assert.equal((await api(`/rooms/${sharedRoom}/access`, ownerToken, {})).status, 201, "first authorized member creates the room ACL")
   assert.equal((await api(`/rooms/${sharedRoom}/access`, outsiderAuth.token, {})).status, 403, "uninvited users cannot enter an existing room")
   assert.equal((await api(`/rooms/${sharedRoom}/invites`, ownerToken, { username: guestName })).status, 204)
@@ -337,11 +383,13 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const project = await projectResponse.json() as { id: string; name: string }
   assert.equal((await api("/projects", outsiderAuth.token)).status, 200)
   assert.deepEqual(await (await api("/projects", outsiderAuth.token)).json(), [], "projects are private until a user is invited")
+  assert.equal((await api(`/projects/${"x".repeat(65)}/files`, ownerToken)).status, 400, "overlong project identifiers are rejected")
   assert.equal((await api(`/projects/${project.id}/invites`, ownerToken, { username: guestName })).status, 204, "owners can invite project collaborators")
   assert.equal((await api(`/projects/${project.id}/files`, outsiderAuth.token)).status, 404, "outsiders cannot list project files")
   const fileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/main.ts" })
   assert.equal(fileResponse.status, 201, "project members can create files")
   const file = await fileResponse.json() as { id: string; path: string; roomId: string; content: string }
+  assert.equal((await api(`/projects/${project.id}/files/${file.id}`, outsiderAuth.token, { path: "stolen.ts" }, "PATCH")).status, 404, "outsiders cannot rename project files")
   assert.ok(file.roomId, "each new file gets an isolated collaboration room")
   const otherFileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/other.ts" })
   assert.equal(otherFileResponse.status, 201)
@@ -453,6 +501,7 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.equal(disposable.status, 201, "invited editors can create files")
   const disposableFile = await disposable.json() as { id: string }
   assert.equal((await api(`/projects/${project.id}/files/${disposableFile.id}`, guestAuth.token, undefined, "DELETE")).status, 204, "files can be deleted")
+  assert.equal((await api(`/projects/${project.id}/files/${disposableFile.id}`, guestAuth.token, undefined, "DELETE")).status, 404, "deleted files stay unavailable")
 
   const removeOutsider = nextMessage(guestProjectPeer.peer.ws, "presence-remove")
   const outsiderClosed = new Promise<void>((resolve) => outsiderProjectPeer.peer.ws.once("close", () => resolve()))
