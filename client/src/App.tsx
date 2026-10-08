@@ -19,6 +19,8 @@ type ServerMessage = {
   user?: { id: string; username: string }
 }
 type AuthResponse = { token: string; user: { id: string; username: string }; error?: string }
+type Project = { id: string; name: string; role: string }
+type WorkspaceFile = { id: string; projectId: string; path: string; content: string; roomId: string | null }
 
 function encodeBase64(bytes: Uint8Array) {
   let binary = ""
@@ -49,11 +51,27 @@ export default function App() {
   const [doc, setDoc] = useState(() => new Y.Doc())
   const [remoteCursor, setRemoteCursor] = useState<{ line: number; column: number } | null>(null)
   const [userCount, setUserCount] = useState(0)
+  const [projects, setProjects] = useState<Project[]>([])
+  const [project, setProject] = useState<Project | null>(null)
+  const [files, setFiles] = useState<WorkspaceFile[]>([])
+  const [activeFile, setActiveFile] = useState<WorkspaceFile | null>(null)
+  const [projectName, setProjectName] = useState("")
   const wsRef = useRef<WebSocket | null>(null)
   const docRef = useRef(doc)
   const activeRoomRef = useRef<string | null>(null)
   const lastCursorRef = useRef("")
   const remoteCursorUserRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!token) return
+    fetch(`${apiUrl}/projects`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(async (response) => {
+        const data = await response.json() as Project[] | { error?: string }
+        if (!response.ok || !Array.isArray(data)) throw new Error("Could not load projects.")
+        setProjects(data)
+      })
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : "Could not load projects."))
+  }, [token])
 
   useEffect(() => {
     const sendUpdate = (update: Uint8Array, origin: unknown) => {
@@ -92,13 +110,128 @@ export default function App() {
     }
   }
 
+  const loadProject = async (selected: Project) => {
+    setError("")
+    try {
+      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(selected.id)}/files`, { headers: { Authorization: `Bearer ${token}` } })
+      const data = await response.json() as WorkspaceFile[] | { error?: string }
+      if (!response.ok || !Array.isArray(data)) throw new Error("Could not load project files.")
+      wsRef.current?.close()
+      setJoined(false)
+      setProject(selected)
+      setFiles(data)
+      setActiveFile(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load project files.")
+    }
+  }
+
+  const createProjectFromForm = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setError("")
+    try {
+      const response = await fetch(`${apiUrl}/projects`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: projectName }),
+      })
+      const created = await response.json() as Project & { error?: string }
+      if (!response.ok) throw new Error(created.error || "Could not create project.")
+      const fileResponse = await fetch(`${apiUrl}/projects/${encodeURIComponent(created.id)}/files`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ path: "main.js" }),
+      })
+      if (!fileResponse.ok) throw new Error("Project created, but its starter file could not be created.")
+      const starter = await fileResponse.json() as WorkspaceFile
+      const nextProject = { ...created, role: "OWNER" }
+      setProjects((items) => [nextProject, ...items])
+      setProjectName("")
+      setProject(nextProject)
+      setFiles([starter])
+      setActiveFile(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create project.")
+    }
+  }
+
+  const createFile = async () => {
+    if (!project) return
+    const path = window.prompt("File path", "src/index.js")
+    if (!path) return
+    try {
+      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(project.id)}/files`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      })
+      const data = await response.json() as WorkspaceFile & { error?: string }
+      if (!response.ok) throw new Error(data.error || "Could not create file.")
+      setFiles((items) => [...items, data].sort((a, b) => a.path.localeCompare(b.path)))
+      openFile(data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create file.")
+    }
+  }
+
+  const renameFile = async (file: WorkspaceFile) => {
+    if (!project) return
+    const path = window.prompt("Rename file", file.path)
+    if (!path || path === file.path) return
+    try {
+      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(project.id)}/files/${encodeURIComponent(file.id)}`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      })
+      const data = await response.json() as WorkspaceFile & { error?: string }
+      if (!response.ok) throw new Error(data.error || "Could not rename file.")
+      setFiles((items) => items.map((item) => item.id === file.id ? data : item).sort((a, b) => a.path.localeCompare(b.path)))
+      if (activeFile?.id === file.id) setActiveFile(data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not rename file.")
+    }
+  }
+
+  const deleteFile = async (file: WorkspaceFile) => {
+    if (!project || !window.confirm(`Delete ${file.path}?`)) return
+    try {
+      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(project.id)}/files/${encodeURIComponent(file.id)}`, {
+        method: "DELETE", headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!response.ok) throw new Error("Could not delete file.")
+      setFiles((items) => items.filter((item) => item.id !== file.id))
+      if (activeFile?.id === file.id) leaveRoom()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete file.")
+    }
+  }
+
+  const openFile = (file: WorkspaceFile) => {
+    if (!file.roomId) {
+      setError("This file has no collaboration document yet. Create a new file to edit it together.")
+      return
+    }
+    const emptyDoc = new Y.Doc()
+    docRef.current = emptyDoc
+    setDoc(emptyDoc)
+    setActiveFile(file)
+    const extension = file.path.split(".").pop()?.toLowerCase()
+    const languageByExtension: Record<string, string> = { js: "javascript", jsx: "javascript", ts: "typescript", tsx: "typescript", py: "python", cpp: "cpp", cc: "cpp", java: "java" }
+    setLanguage(languageByExtension[extension ?? ""] ?? "javascript")
+    connect(file.roomId)
+  }
+
   const connect = async (targetRoom = roomId) => {
     const normalizedRoom = targetRoom.trim()
     if (!normalizedRoom || normalizedRoom.length > 64) {
       setError("Enter a room ID between 1 and 64 characters.")
       return
     }
-    wsRef.current?.close()
+    const previousSocket = wsRef.current
+    wsRef.current = null
+    activeRoomRef.current = null
+    previousSocket?.close()
     setError("")
     setStatus("connecting")
     try {
@@ -218,19 +351,23 @@ export default function App() {
     setOutput("")
     setRemoteCursor(null)
     remoteCursorUserRef.current = null
+    setActiveFile(null)
     setError("")
   }
 
   const inviteMember = async () => {
     try {
-      const response = await fetch(`${apiUrl}/rooms/${encodeURIComponent(roomId)}/invites`, {
+      const inviteUrl = project
+        ? `${apiUrl}/projects/${encodeURIComponent(project.id)}/invites`
+        : `${apiUrl}/rooms/${encodeURIComponent(roomId)}/invites`
+      const response = await fetch(inviteUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ username: inviteUsername }),
       })
       const data = await response.json().catch(() => ({})) as { error?: string }
       if (!response.ok) throw new Error(data.error || `Invite failed (HTTP ${response.status}).`)
-      setError(`${inviteUsername} can now join ${roomId}.`)
+      setError(`${inviteUsername} can now access ${project?.name ?? roomId}.`)
       setInviteUsername("")
     } catch (err) {
       setError(err instanceof Error ? err.message : "Invite failed.")
@@ -247,6 +384,9 @@ export default function App() {
     } finally {
       setToken("")
       setUsername("")
+      setProjects([])
+      setProject(null)
+      setFiles([])
     }
   }
 
@@ -300,23 +440,48 @@ export default function App() {
 
   if (!joined) {
     return <main className="join-screen">
-      <form className="join-box" onSubmit={(event) => { event.preventDefault(); connect() }}>
+      <section className="project-home">
         <div className="logo"><span>Code</span><strong>Sync</strong></div>
-        <p className="tagline">A shared space to write code together.</p>
-        <p className="tagline">Signed in as <strong>{username}</strong></p>
-        <label htmlFor="room-id">Room ID</label>
-        <input id="room-id" autoComplete="off" maxLength={64} placeholder="Enter a room ID" value={roomId} onChange={(event) => setRoomId(event.target.value)} />
-        <button type="submit" disabled={status === "connecting"}>{status === "connecting" ? "Connecting…" : "Join room"}</button>
-        <button type="button" className="secondary" onClick={logout}>Sign out</button>
+        <div className="project-heading"><div><h1>{project?.name ?? "Your projects"}</h1><p className="tagline">Signed in as <strong>{username}</strong></p></div>
+          {project && <button className="secondary" onClick={() => setProject(null)}>All projects</button>}
+          <button className="secondary" onClick={logout}>Sign out</button>
+        </div>
+        {!project ? <>
+          <form className="create-project" onSubmit={createProjectFromForm}>
+            <input aria-label="Project name" placeholder="New project name" maxLength={80} required value={projectName} onChange={(event) => setProjectName(event.target.value)} />
+            <button type="submit">Create project</button>
+          </form>
+          <div className="project-list" aria-label="Projects">
+            {projects.map((item) => <button className="project-card" key={item.id} onClick={() => loadProject(item)}><strong>{item.name}</strong><span>{item.role.toLowerCase()}</span></button>)}
+            {!projects.length && <p className="tagline">No projects yet. Create one to start a multi-file workspace.</p>}
+          </div>
+          <details className="legacy-room"><summary>Join an existing room</summary>
+            <form className="create-project" onSubmit={(event) => { event.preventDefault(); setProject(null); connect() }}>
+              <input aria-label="Room ID" autoComplete="off" maxLength={64} placeholder="Enter a room ID" value={roomId} onChange={(event) => setRoomId(event.target.value)} />
+              <button type="submit" disabled={status === "connecting"}>{status === "connecting" ? "Connecting…" : "Join room"}</button>
+            </form>
+          </details>
+        </> : <>
+          <div className="file-heading"><h2>Files</h2><button onClick={createFile}>New file</button></div>
+          <ul className="project-files">
+            {files.map((file) => <li key={file.id}>
+              <button className={`file-open${activeFile?.id === file.id ? " selected" : ""}`} onClick={() => openFile(file)}>{file.path}</button>
+              <button className="file-action" aria-label={`Rename ${file.path}`} title="Rename" onClick={() => renameFile(file)}>✎</button>
+              <button className="file-action" aria-label={`Delete ${file.path}`} title="Delete" onClick={() => deleteFile(file)}>×</button>
+            </li>)}
+            {!files.length && <li className="tagline">This project has no files.</li>}
+          </ul>
+          {activeFile && <button className="open-workspace" onClick={() => openFile(activeFile)}>Open {activeFile.path}</button>}
+        </>}
         {error && <p className="error" role="alert">{error}</p>}
-      </form>
+      </section>
     </main>
   }
 
   return <main className="app">
     <header className="topbar">
       <div className="logo"><span>Code</span><strong>Sync</strong></div>
-      <div className="room-details"><span>Room</span><code>{roomId}</code><button className="secondary" onClick={copyRoomId}>Copy ID</button></div>
+      <div className="room-details"><span>{project?.name ?? "Room"}</span><code>{activeFile?.path ?? roomId}</code>{!project && <button className="secondary" onClick={copyRoomId}>Copy ID</button>}</div>
       <div className="toolbar">
         <span className={`connection ${status}`}><i />{status === "connected" ? "Connected" : status === "connecting" ? "Connecting" : "Disconnected"}</span>
         <span className="user-count">{userCount} {userCount === 1 ? "person" : "people"}</span>
@@ -333,6 +498,9 @@ export default function App() {
     </header>
     {error && <div className="notice" role="status">{error}<button aria-label="Dismiss" onClick={() => setError("")}>×</button></div>}
     <section className="workspace">
+      {project && <aside className="file-explorer"><div className="explorer-heading"><span>EXPLORER</span><button title="New file" aria-label="New file" onClick={createFile}>+</button></div><div className="explorer-project">{project.name}</div>
+        {files.map((file) => <div className={`explorer-file${activeFile?.id === file.id ? " selected" : ""}`} key={file.id} style={{ paddingLeft: `${8 + Math.max(0, file.path.split("/").length - 1) * 12}px` }}><button title={file.path} onClick={() => openFile(file)}>{file.path.split("/").at(-1)}</button><span><button aria-label={`Rename ${file.path}`} title="Rename" onClick={() => renameFile(file)}>✎</button><button aria-label={`Delete ${file.path}`} title="Delete" onClick={() => deleteFile(file)}>×</button></span></div>)}
+      </aside>}
       <div className="editor-container"><CodeEditor doc={doc} language={language} remoteCursor={remoteCursor} onCursorMove={updateCursor} /></div>
       <aside className="output-container"><div className="output-title">Output</div><pre>{output || "Run your code to see output here."}</pre></aside>
     </section>

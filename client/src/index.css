@@ -37,6 +37,24 @@ button:disabled { opacity: .6; cursor: wait; }
 .join-box input { padding: 11px 12px; border: 1px solid #3b4149; border-radius: 6px; outline: none; background: #111316; color: #e6e8eb; }
 .join-box input:focus, select:focus { border-color: #4a8fea; }
 .error { margin: 0; color: #ffb4a9; font-size: 13px; }
+.project-home { width: min(760px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; padding: 26px; background: #191c20; border: 1px solid #2e3339; border-radius: 10px; }
+.project-heading, .file-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 24px; }
+.project-heading h1, .file-heading h2 { margin: 0; font-size: 20px; }
+.project-heading .tagline { margin: 5px 0 0; }
+.create-project { display: flex; gap: 9px; margin-top: 18px; }
+.create-project input { flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid #3b4149; border-radius: 6px; outline: none; background: #111316; color: #e6e8eb; }
+.project-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top: 16px; }
+.project-card { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 14px; border-color: #343a42; background: #202429; text-align: left; }
+.project-card span { color: #9da4ad; font-size: 12px; font-weight: 400; }
+.legacy-room { margin-top: 24px; color: #9da4ad; font-size: 13px; }
+.legacy-room summary { cursor: pointer; }
+.project-files { list-style: none; margin: 12px 0 0; padding: 0; }
+.project-files li { display: flex; align-items: center; gap: 5px; min-height: 38px; border-bottom: 1px solid #282d33; }
+.file-open { flex: 1; padding: 7px 9px; border: 0; background: transparent; color: #d4d9df; text-align: left; }
+.file-open:hover, .file-open.selected { background: #252c35; }
+.file-action { padding: 4px 8px; border-color: transparent; background: transparent; color: #9da4ad; }
+.file-action:hover { background: #30363d; }
+.open-workspace { margin-top: 16px; }
 
 .app { display: flex; flex-direction: column; height: 100%; min-height: 0; background: #101214; }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 62px; padding: 0 18px; border-bottom: 1px solid #2b3036; background: #191c20; }
@@ -53,6 +71,16 @@ button:disabled { opacity: .6; cursor: wait; }
 .user-count { color: #9da4ad; font-size: 12px; white-space: nowrap; }
 
 .workspace { display: flex; flex: 1; min-height: 0; }
+.file-explorer { flex: none; width: 230px; overflow: auto; padding: 12px 8px; border-right: 1px solid #2b3036; background: #171a1e; }
+.explorer-heading, .explorer-file, .explorer-file span { display: flex; align-items: center; justify-content: space-between; }
+.explorer-heading { padding: 0 7px 12px; color: #929ba5; font-size: 11px; font-weight: 700; letter-spacing: .7px; }
+.explorer-heading button, .explorer-file span button { padding: 2px 7px; border-color: transparent; background: transparent; color: #aab2bb; }
+.explorer-project { padding: 5px 8px; color: #d8dde3; font-size: 12px; font-weight: 700; }
+.explorer-file { min-height: 30px; padding-left: 8px; border-radius: 4px; }
+.explorer-file.selected, .explorer-file:hover { background: #252c35; }
+.explorer-file > button { flex: 1; overflow: hidden; padding: 5px 2px; border: 0; background: transparent; color: #c3cad2; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 400; }
+.explorer-file span { gap: 0; }
+.explorer-file span button { padding-inline: 5px; }
 .editor-container { flex: 1; min-width: 0; }
 .output-container { flex: none; width: 310px; overflow: auto; padding: 16px; border-left: 1px solid #2b3036; background: #15181b; }
 .output-title { margin-bottom: 12px; color: #c6cbd1; font-size: 13px; font-weight: 650; }
@@ -75,4 +103,7 @@ button:disabled { opacity: .6; cursor: wait; }
   .toolbar { width: 100%; margin: 0; }
   .toolbar select { flex: 1; }
   .user-count { display: none; }
+  .file-explorer { width: 145px; }
+  .project-home { padding: 18px; }
+  .project-heading { flex-wrap: wrap; }
 }

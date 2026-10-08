@@ -1,0 +1,3 @@
+ALTER TABLE "File" ADD COLUMN "roomId" TEXT;
+CREATE UNIQUE INDEX "File_roomId_key" ON "File"("roomId");
+ALTER TABLE "File" ADD CONSTRAINT "File_roomId_fkey" FOREIGN KEY ("roomId") REFERENCES "Room"("id") ON DELETE CASCADE ON UPDATE CASCADE;

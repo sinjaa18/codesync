@@ -1,0 +1,61 @@
+import * as Y from "yjs"
+import { randomUUID } from "node:crypto"
+import { prisma } from "../db/client.js"
+
+export async function getProjectRole(projectId: string, userId: string) {
+  const membership = await prisma.projectMembership.findUnique({
+    where: { projectId_userId: { projectId, userId } },
+    select: { role: true },
+  })
+  return membership?.role ?? null
+}
+
+export async function createProject(ownerId: string, name: string) {
+  const project = await prisma.project.create({
+    data: {
+      name,
+      ownerId,
+      memberships: { create: { userId: ownerId, role: "OWNER" } },
+    },
+    select: { id: true, name: true, ownerId: true, createdAt: true, updatedAt: true },
+  })
+  return project
+}
+
+export async function createProjectFile(projectId: string, userId: string, path: string) {
+  const role = await getProjectRole(projectId, userId)
+  if (role !== "OWNER" && role !== "EDITOR") return null
+
+  const doc = new Y.Doc()
+  doc.getText("code").insert(0, "")
+  const update = Buffer.from(Y.encodeStateAsUpdate(doc))
+  doc.destroy()
+  const fileId = `file_${randomUUID().replaceAll("-", "")}`
+  const roomId = `f_${randomUUID().replaceAll("-", "")}`
+  return prisma.$transaction(async (tx) => {
+    await tx.room.create({
+      data: {
+        id: roomId,
+        ownerId: userId,
+        projectId,
+        updates: { create: { update } },
+      },
+    })
+    return tx.file.create({
+      data: { id: fileId, projectId, path, roomId },
+      select: { id: true, projectId: true, path: true, content: true, roomId: true, createdAt: true, updatedAt: true },
+    })
+  })
+}
+
+export async function inviteProjectMember(projectId: string, ownerId: string, memberId: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
+  if (project?.ownerId !== ownerId) return false
+  if (ownerId === memberId) return true
+  await prisma.projectMembership.upsert({
+    where: { projectId_userId: { projectId, userId: memberId } },
+    create: { projectId, userId: memberId, role: "EDITOR" },
+    update: { role: "EDITOR" },
+  })
+  return true
+}

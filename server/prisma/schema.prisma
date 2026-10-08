@@ -79,6 +79,7 @@ model Room {
   project     Project?          @relation(fields: [projectId], references: [id], onDelete: SetNull)
   memberships RoomMembership[]
   updates     DocumentUpdate[]
+  file        File?
 
   @@index([ownerId, updatedAt])
   @@index([projectId])
@@ -114,6 +115,8 @@ model File {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  roomId    String?  @unique
+  room      Room?    @relation(fields: [roomId], references: [id], onDelete: Cascade)
 
   @@unique([projectId, path])
   @@index([projectId, updatedAt])

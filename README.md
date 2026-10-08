@@ -11,7 +11,7 @@
 
 > **Write code together. See changes instantly. Run it safely.**
 
-CodeSync is a browser-based collaborative code editor where multiple users can join the same room, edit a shared Monaco document, see remote cursor positions, and execute code through the Judge0 sandbox API.
+CodeSync is a browser-based collaborative code workspace with project file trees, per-file Monaco editing, Yjs synchronization, room and project access controls, and code execution through the Judge0 sandbox API.
 
 ---
 
@@ -34,6 +34,9 @@ Open the application in two browser tabs, join the same room, and start editing.
 | Feature | Description |
 |---|---|
 | 🏠 Room-based collaboration | Join a shared workspace using a room ID |
+| 🗂️ Project workspaces | Create projects with a focused file explorer |
+| 📄 Multi-file editing | Create, rename, delete, and open persistent project files |
+| 🤝 Per-file collaboration | Each project file has an isolated persistent Yjs document |
 | 🔐 Accounts and sessions | Sign up, sign in, and revoke the current session |
 | 🔑 Room authorization | Owners invite registered usernames before they can join |
 | ⚡ Real-time editing | Code changes are synchronized through WebSockets |
@@ -251,6 +254,7 @@ Current protections include:
 - Authentication rate limit of 10 attempts per IP per minute
 - Authenticated WebSocket sessions and server-owned collaborator identities
 - Owner-controlled room membership; execution and room APIs require authentication
+- Project owners can invite registered users; project members can access and edit files
 - server-side execution request validation
 - external sandbox execution through Judge0
 - bounded source/runtime settings
@@ -284,7 +288,7 @@ npm test
 
 The test requires `DATABASE_URL` to point to a migrated PostgreSQL database. It creates uniquely named test data and deletes its test users afterward.
 
-It checks signup, duplicate signup, invalid login, protected endpoints, room invitations, unauthorized WebSocket joins, logout revocation, concurrent edits, late joins, room isolation, cursor events, disconnect cleanup, and reconnect reconciliation. It reports loopback update latency for one local run; those measurements are indicative and are not a load test.
+It checks signup, duplicate signup, invalid login, protected endpoints, room and project invitations, file creation/rename/deletion, path validation, outsider denial, per-file isolation, unauthorized WebSocket joins, logout revocation, concurrent edits, late joins, cursor events, disconnect cleanup, and restart recovery. On the local Windows/PostgreSQL 18 run, 10 sequential loopback Yjs updates measured p50 6.14 ms and p95 18.24 ms. This small sample is not a load test.
 
 Other deployment and Judge0 checks below reflect prior project verification and are not part of this collaboration integration test.
 
@@ -489,7 +493,7 @@ Prisma manages these PostgreSQL tables:
 - `User` and `Session` for accounts and hashed, expiring bearer sessions
 - `Room` and `RoomMembership` for room ownership and access
 - `DocumentUpdate` for the ordered Yjs update log used to restore room documents
-- `Project`, `ProjectMembership`, and `File` for the upcoming workspace APIs
+- `Project`, `ProjectMembership`, and `File` for project workspaces and file metadata/content
 
 Foreign keys cascade when an owner or parent record is removed. Indexes cover session expiry, room membership lookups, project membership lookups, and per-room update replay.
 
@@ -529,6 +533,20 @@ POST /rooms/:roomId/invites
 
 The first authenticated user to request access creates the room and becomes its owner. Existing room members can reconnect; only the owner can invite an existing account with `{ "username": "..." }`. The invitation must be sent out of band along with the room ID.
 
+### Project workspaces
+
+```http
+GET    /projects
+POST   /projects                      { "name": "..." }
+POST   /projects/:projectId/invites   { "username": "..." }
+GET    /projects/:projectId/files
+POST   /projects/:projectId/files     { "path": "src/main.ts" }
+PATCH  /projects/:projectId/files/:fileId { "path": "src/app.ts" }
+DELETE /projects/:projectId/files/:fileId
+```
+
+All project endpoints require a bearer session. Project owners invite existing accounts; invited project members can list files, create/rename/delete files, and join their Yjs documents. File paths are relative, limited to safe path segments, and unique within a project. Each file is assigned a separate room, so its live Yjs content and update log are independent from other files. `File.content` is a PostgreSQL snapshot kept in sync with each accepted document update.
+
 ### Execute Code
 
 ```http
@@ -564,7 +582,7 @@ users (participant count)
 user-left
 ```
 
-The server returns the update missing from the joining client's state vector. It appends received Yjs updates to PostgreSQL and replays them to rebuild the in-memory document cache when a room is opened.
+The server returns the update missing from the joining client's state vector. It appends received Yjs updates to PostgreSQL and replays them to rebuild the in-memory document cache when a room is opened. Project file rooms authorize through project membership; the legacy room flow continues to use room membership.
 The authenticated account supplies the user identity; clients cannot choose an identity in cursor or document messages.
 
 ---
@@ -579,7 +597,7 @@ Yjs merges concurrent text edits. Updates persist in PostgreSQL as an append-onl
 
 ### Persistence
 
-PostgreSQL stores accounts, sessions, room memberships, and collaborative document updates. Project and file models exist, but their APIs are part of the next workspace phase.
+PostgreSQL stores accounts, sessions, project and room memberships, file metadata/content snapshots, and collaborative document updates. File document updates remain an append-only log; compaction is not implemented.
 
 ### Authentication
 
@@ -604,22 +622,16 @@ Code execution depends on the configured external Judge0 service and its availab
 ```text
 Current
   │
-  ├── PostgreSQL accounts, sessions, rooms, and Yjs updates
-  ├── Yjs conflict-free synchronization
+  ├── PostgreSQL accounts, projects, files, memberships, and Yjs updates
+  ├── Per-file conflict-free Yjs synchronization
   ├── Process-local WebSocket connections
   └── Single server instance
-        │
-        ▼
-Next
-  │
-  ├── Project and file APIs backed by PostgreSQL
-  ├── Per-user cursor presence
-  └── Project and file authorization APIs
         │
         ▼
 Future
   │
   ├── Yjs update compaction and history browsing
+  ├── Per-user cursor and active-file presence
   ├── Redis-based distributed presence
   ├── Multi-instance WebSocket scaling
   ├── Distributed rate limiting

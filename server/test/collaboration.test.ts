@@ -41,9 +41,9 @@ function nextMessage(ws: WebSocket, type: string, timeoutMs = 3_000): Promise<Me
   })
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 3_000) {
+async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs
-  while (!condition()) {
+  while (!await condition()) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for collaborative state")
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
@@ -80,11 +80,11 @@ async function stopServer(child: ReturnType<typeof spawn>) {
   })
 }
 
-async function api(path: string, token?: string, body?: unknown) {
+async function api(path: string, token?: string, body?: unknown, method?: string) {
   return fetch(`http://127.0.0.1:${port}${path}`, {
-    method: body ? "POST" : "GET",
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+    method: method ?? (body !== undefined ? "POST" : "GET"),
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   })
 }
 
@@ -276,14 +276,38 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   latencies.sort((a, b) => a - b)
   t.diagnostic(`Local WebSocket Yjs sync: 10 sequential updates; p50 ${latencies[4].toFixed(2)} ms, p95 ${latencies[9].toFixed(2)} ms.`)
 
-  const project = await prisma.project.create({
-    data: {
-      name: `${prefix}project`,
-      ownerId: ownerAuth.user.id,
-      memberships: { create: { userId: guestAuth.user.id, role: "EDITOR" } },
-      files: { create: { path: "src/main.ts", content: "export const ready = true" } },
-    },
-  })
+  const projectResponse = await api("/projects", ownerToken, { name: `${prefix}project` })
+  assert.equal(projectResponse.status, 201, "authenticated users can create projects")
+  const project = await projectResponse.json() as { id: string; name: string }
+  assert.equal((await api("/projects", outsiderAuth.token)).status, 200)
+  assert.deepEqual(await (await api("/projects", outsiderAuth.token)).json(), [], "projects are private until a user is invited")
+  assert.equal((await api(`/projects/${project.id}/invites`, ownerToken, { username: guestName })).status, 204, "owners can invite project collaborators")
+  assert.equal((await api(`/projects/${project.id}/files`, outsiderAuth.token)).status, 404, "outsiders cannot list project files")
+  const fileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/main.ts" })
+  assert.equal(fileResponse.status, 201, "project members can create files")
+  const file = await fileResponse.json() as { id: string; path: string; roomId: string; content: string }
+  assert.ok(file.roomId, "each new file gets an isolated collaboration room")
+  const otherFileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/other.ts" })
+  assert.equal(otherFileResponse.status, 201)
+  const otherFile = await otherFileResponse.json() as { roomId: string }
+  assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "../secrets.txt" })).status, 400, "file paths reject traversal")
+  assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "src/main.ts" })).status, 409, "duplicate file paths are rejected")
+  const guestProjectPeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
+  peers.push(guestProjectPeer.peer)
+  assert.equal(guestProjectPeer.peer.doc.getText("code").toString(), "", "a project member can join the file document")
+  const otherFilePeer = await connectPeer(new Y.Doc(), otherFile.roomId, ownerToken)
+  peers.push(otherFilePeer.peer)
+  await assertSocketRoomDenied(outsiderAuth.token, file.roomId)
+  guestProjectPeer.peer.doc.getText("code").insert(0, "export const ready = true")
+  await waitFor(async () => (await prisma.file.findUnique({ where: { id: file.id } }))?.content === "export const ready = true")
+  assert.equal(otherFilePeer.peer.doc.getText("code").toString(), "", "edits stay isolated to their file")
+  const renamed = await api(`/projects/${project.id}/files/${file.id}`, ownerToken, { path: "src/ready.ts" }, "PATCH")
+  assert.equal(renamed.status, 200, "file paths can be renamed")
+  assert.equal(((await renamed.json()) as { path: string }).path, "src/ready.ts")
+  const disposable = await api(`/projects/${project.id}/files`, guestAuth.token, { path: "scratch.js" })
+  assert.equal(disposable.status, 201, "invited editors can create files")
+  const disposableFile = await disposable.json() as { id: string }
+  assert.equal((await api(`/projects/${project.id}/files/${disposableFile.id}`, guestAuth.token, undefined, "DELETE")).status, 204, "files can be deleted")
 
   for (const peer of peers) {
     if (peer.ws.readyState === WebSocket.OPEN) peer.ws.close()
@@ -297,8 +321,13 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.equal((await api("/auth/me", ownerToken)).status, 200, "account sessions survive a backend restart")
   assert.equal((await api(`/rooms/${sharedRoom}/access`, guestAuth.token, {})).status, 200, "room authorization survives a backend restart")
   const recoveredProject = await prisma.project.findUnique({ where: { id: project.id }, include: { memberships: true, files: true } })
-  assert.equal(recoveredProject?.memberships[0]?.userId, guestAuth.user.id, "project membership survives a restart")
-  assert.equal(recoveredProject?.files[0]?.content, "export const ready = true", "file content survives a restart")
+  assert.ok(recoveredProject?.memberships.some((membership) => membership.userId === guestAuth.user.id), "project membership survives a restart")
+  assert.equal(recoveredProject?.files.find((entry) => entry.id === file.id)?.content, "export const ready = true", "file content survives a restart")
+  assert.equal(recoveredProject?.files.find((entry) => entry.id === file.id)?.path, "src/ready.ts", "file renames survive a restart")
+  assert.equal((await api(`/projects/${project.id}/files`, guestAuth.token)).status, 200, "project access survives a restart")
+  const recoveredFilePeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
+  peers.push(recoveredFilePeer.peer)
+  assert.equal(recoveredFilePeer.peer.doc.getText("code").toString(), "export const ready = true", "each file's Yjs state survives restart")
   const recovered = await connectPeer(new Y.Doc(), sharedRoom, guestAuth.token)
   peers.push(recovered.peer)
   assert.equal(recovered.peer.doc.getText("code").toString(), secondDoc.getText("code").toString(), "persisted Yjs updates restore the latest room document")

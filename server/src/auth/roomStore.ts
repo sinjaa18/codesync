@@ -14,7 +14,12 @@ export async function ensureRoomAccess(roomId: string, userId: string) {
     where: { id: roomId },
     include: { memberships: { where: { userId }, select: { userId: true } } },
   })
-  if (existing) return { created: false, allowed: existing.memberships.length > 0 }
+  if (existing) {
+    const projectMember = existing.projectId
+      ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: existing.projectId, userId } }, select: { userId: true } })
+      : null
+    return { created: false, allowed: existing.memberships.length > 0 || Boolean(projectMember) }
+  }
 
   try {
     await prisma.room.create({
@@ -29,7 +34,8 @@ export async function ensureRoomAccess(roomId: string, userId: string) {
   } catch (error) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") {
       const room = await prisma.room.findUnique({ where: { id: roomId }, include: { memberships: { where: { userId } } } })
-      return { created: false, allowed: Boolean(room?.memberships.length) }
+      const projectMember = room?.projectId ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }) : null
+      return { created: false, allowed: Boolean(room?.memberships.length || projectMember) }
     }
     throw error
   }
@@ -48,8 +54,11 @@ export async function inviteRoomMember(roomId: string, ownerId: string, memberId
 }
 
 export async function hasRoomAccess(roomId: string, userId: string) {
-  const membership = await prisma.roomMembership.findUnique({ where: { roomId_userId: { roomId, userId } } })
-  return Boolean(membership)
+  const membership = await prisma.roomMembership.findUnique({ where: { roomId_userId: { roomId, userId } }, select: { userId: true } })
+  if (membership) return true
+  const room = await prisma.room.findUnique({ where: { id: roomId }, select: { projectId: true } })
+  if (!room?.projectId) return false
+  return Boolean(await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }))
 }
 
 export async function loadRoomDocument(roomId: string) {
@@ -59,9 +68,10 @@ export async function loadRoomDocument(roomId: string) {
   return doc
 }
 
-export async function persistRoomUpdate(roomId: string, update: Uint8Array) {
+export async function persistRoomUpdate(roomId: string, update: Uint8Array, content: string) {
   await prisma.$transaction([
     prisma.documentUpdate.create({ data: { roomId, update: Buffer.from(update) } }),
     prisma.room.update({ where: { id: roomId }, data: { updatedAt: new Date() } }),
+    prisma.file.updateMany({ where: { roomId }, data: { content } }),
   ])
 }

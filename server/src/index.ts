@@ -7,6 +7,7 @@ import * as Y from "yjs"
 import executionRoutes from "./routes/execution.route.js"
 import authRoutes from "./routes/auth.route.js"
 import roomRoutes from "./routes/room.route.js"
+import projectRoutes from "./routes/project.route.js"
 import type { WSMessage } from "./types/ws.types.js"
 import { getSession, onSessionRevoked } from "./auth/store.js"
 import type { User } from "./auth/store.js"
@@ -24,6 +25,7 @@ const socketUsers = new Map<WebSocket, User>()
 const socketExpiryTimers = new Map<WebSocket, NodeJS.Timeout>()
 const roomDocs = new Map<string, Y.Doc>()
 const roomDocLoads = new Map<string, Promise<Y.Doc>>()
+const roomPersistenceQueues = new Map<string, Promise<void>>()
 const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()) ?? ["http://localhost:5173"]
 
 const messageSchema = z.discriminatedUnion("type", [
@@ -179,7 +181,15 @@ wss.on("connection", (ws, request) => {
       try {
         const update = decodeBase64(message.update)
         Y.applyUpdate(doc, update)
-        await persistRoomUpdate(member.roomId, update)
+        const content = doc.getText("code").toString()
+        const previous = roomPersistenceQueues.get(member.roomId) ?? Promise.resolve()
+        const persisted = previous.catch(() => undefined).then(() => persistRoomUpdate(member.roomId, update, content))
+        roomPersistenceQueues.set(member.roomId, persisted)
+        try {
+          await persisted
+        } finally {
+          if (roomPersistenceQueues.get(member.roomId) === persisted) roomPersistenceQueues.delete(member.roomId)
+        }
       } catch {
         send(ws, { type: "error", message: "The document update could not be applied or saved." })
         return
@@ -203,9 +213,10 @@ wss.on("connection", (ws, request) => {
 })
 
 app.use(cors({ origin: allowedOrigins }))
-app.use(express.json({ limit: "32kb" }))
+app.use(express.json({ limit: "1mb" }))
 app.use("/auth", authRoutes)
 app.use("/rooms", roomRoutes)
+app.use("/projects", projectRoutes)
 app.use("/", executionRoutes)
 app.get("/", (_req, res) => res.send("CodeSync server is running."))
 
