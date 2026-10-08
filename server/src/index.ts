@@ -11,7 +11,7 @@ import projectRoutes from "./routes/project.route.js"
 import type { WSMessage } from "./types/ws.types.js"
 import { getSession, onSessionRevoked } from "./auth/store.js"
 import type { User } from "./auth/store.js"
-import { hasRoomAccess, loadRoomDocument, persistRoomUpdate } from "./auth/roomStore.js"
+import { getRoomPresenceContext, hasRoomAccess, loadRoomDocument, persistRoomUpdate } from "./auth/roomStore.js"
 import { prisma } from "./db/client.js"
 
 const app = express()
@@ -19,7 +19,11 @@ const port = Number(process.env.PORT) || 5000
 const server = createServer(app)
 const wss = new WebSocketServer({ server, maxPayload: 1_000_000 })
 const rooms = new Map<string, Set<WebSocket>>()
-const membership = new Map<WebSocket, { roomId: string; userId: string }>()
+type PresenceCursor = { line: number; column: number } | null
+type Presence = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: PresenceCursor; online: true }
+type Membership = { roomId: string; userId: string; scopeKey: string }
+const membership = new Map<WebSocket, Membership>()
+const presenceScopes = new Map<string, Map<string, { ws: WebSocket; presence: Presence }>>()
 const socketSessions = new Map<WebSocket, string>()
 const socketUsers = new Map<WebSocket, User>()
 const socketExpiryTimers = new Map<WebSocket, NodeJS.Timeout>()
@@ -32,8 +36,16 @@ const messageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("authenticate"), token: z.string().min(40).max(60) }),
   z.object({ type: z.literal("join"), roomId: z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/), stateVector: z.string().max(20_000).optional() }),
   z.object({ type: z.literal("doc-update"), roomId: z.string().min(1).max(64), update: z.string().min(4).max(750_000) }),
-  z.object({ type: z.literal("cursor-update"), roomId: z.string().min(1).max(64), line: z.number().int().min(1), column: z.number().int().min(1) }),
+  z.object({ type: z.literal("presence-update"), cursor: z.object({ line: z.number().int().min(1), column: z.number().int().min(1) }).strict().nullable(), userId: z.string().optional() }).strict(),
 ])
+
+const presenceColors = ["#f28b82", "#fbbc04", "#34a853", "#8ab4f8", "#c58af9", "#ff8bcb", "#78d9ec", "#f6bf76"]
+
+function colorForUser(userId: string) {
+  let hash = 0
+  for (const character of userId) hash = (hash * 31 + character.charCodeAt(0)) >>> 0
+  return presenceColors[hash % presenceColors.length]!
+}
 
 function getRoomDoc(roomId: string) {
   const existing = roomDocs.get(roomId)
@@ -70,12 +82,24 @@ function broadcast(roomId: string, message: object, sender?: WebSocket) {
   }
 }
 
+function broadcastPresence(scopeKey: string, message: object, sender?: WebSocket) {
+  for (const entry of presenceScopes.get(scopeKey)?.values() ?? []) {
+    if (entry.ws !== sender) send(entry.ws, message)
+  }
+}
+
 function leaveRoom(ws: WebSocket) {
   const member = membership.get(ws)
   if (!member) return
   const room = rooms.get(member.roomId)
   room?.delete(ws)
   membership.delete(ws)
+  const scope = presenceScopes.get(member.scopeKey)
+  if (scope?.get(member.userId)?.ws === ws) {
+    scope.delete(member.userId)
+    if (!scope.size) presenceScopes.delete(member.scopeKey)
+    else broadcastPresence(member.scopeKey, { type: "presence-remove", userId: member.userId })
+  }
   if (!room?.size) {
     rooms.delete(member.roomId)
     roomDocs.get(member.roomId)?.destroy()
@@ -155,13 +179,38 @@ wss.on("connection", (ws, request) => {
         send(ws, { type: "error", message: "You are not authorized to join this room." })
         return
       }
+      const context = await getRoomPresenceContext(roomId)
+      if (!context) {
+        send(ws, { type: "error", message: "The collaboration room no longer exists." })
+        return
+      }
+      const scopeKey = context.projectId ? `project:${context.projectId}` : `room:${roomId}`
+      const scope = presenceScopes.get(scopeKey)
+      const previousUserSocket = scope?.get(userId)?.ws
+      if (previousUserSocket && previousUserSocket !== ws) {
+        leaveRoom(previousUserSocket)
+        previousUserSocket.close(1000, "Presence moved to another connection")
+      }
       leaveRoom(ws)
       const room = rooms.get(roomId) ?? new Set<WebSocket>()
       const doc = await getRoomDoc(roomId)
       room.add(ws)
       rooms.set(roomId, room)
       roomDocs.set(roomId, doc)
-      membership.set(ws, { roomId, userId })
+      membership.set(ws, { roomId, userId, scopeKey })
+      const collaborator: Presence = {
+        userId,
+        username: authenticatedUser.username,
+        color: colorForUser(userId),
+        projectId: context.projectId,
+        fileId: context.fileId,
+        filePath: context.filePath,
+        cursor: null,
+        online: true,
+      }
+      const nextScope = presenceScopes.get(scopeKey) ?? new Map<string, { ws: WebSocket; presence: Presence }>()
+      nextScope.set(userId, { ws, presence: collaborator })
+      presenceScopes.set(scopeKey, nextScope)
       send(ws, {
         type: "joined",
         roomId,
@@ -169,12 +218,19 @@ wss.on("connection", (ws, request) => {
         stateVector: Buffer.from(Y.encodeStateVector(doc)).toString("base64"),
         count: room.size,
       })
+      send(ws, {
+        type: "presence-state",
+        collaborators: [...nextScope.values()].map((entry) => entry.presence.fileId === context.fileId
+          ? entry.presence
+          : { ...entry.presence, cursor: null }),
+      })
+      broadcastPresence(scopeKey, { type: "presence-update", collaborator }, ws)
       broadcast(roomId, { type: "users", count: room.size }, ws)
       return
     }
 
     const member = membership.get(ws)
-    if (!member || message.roomId !== member.roomId) return
+    if (!member || (message.type === "doc-update" && message.roomId !== member.roomId)) return
     if (message.type === "doc-update") {
       const doc = roomDocs.get(member.roomId)
       if (!doc) return
@@ -195,8 +251,18 @@ wss.on("connection", (ws, request) => {
         return
       }
       broadcast(member.roomId, { ...message, userId: member.userId }, ws)
-    } else if (message.type === "cursor-update") {
-      broadcast(member.roomId, { ...message, userId: member.userId }, ws)
+    } else if (message.type === "presence-update") {
+      const entry = presenceScopes.get(member.scopeKey)?.get(member.userId)
+      if (!entry || entry.ws !== ws) return
+      const collaborator = { ...entry.presence, cursor: message.cursor }
+      presenceScopes.get(member.scopeKey)!.set(member.userId, { ws, presence: collaborator })
+      if (message.cursor) {
+        for (const client of rooms.get(member.roomId) ?? []) {
+          if (client !== ws) send(client, { type: "presence-update", collaborator })
+        }
+      } else {
+        broadcastPresence(member.scopeKey, { type: "presence-update", collaborator }, ws)
+      }
     }
   })
   const cleanup = () => {

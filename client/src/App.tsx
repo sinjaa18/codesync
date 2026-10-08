@@ -14,11 +14,12 @@ type ServerMessage = {
   stateVector?: string
   count?: number
   userId?: string
-  line?: number
-  column?: number
+  collaborator?: Collaborator
+  collaborators?: Collaborator[]
   user?: { id: string; username: string }
 }
 type AuthResponse = { token: string; user: { id: string; username: string }; error?: string }
+type Collaborator = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: { line: number; column: number } | null; online: boolean }
 type Project = { id: string; name: string; role: string }
 type WorkspaceFile = { id: string; projectId: string; path: string; content: string; roomId: string | null }
 
@@ -37,6 +38,7 @@ function decodeBase64(value: string) {
 
 export default function App() {
   const [token, setToken] = useState("")
+  const [currentUserId, setCurrentUserId] = useState("")
   const [username, setUsername] = useState("")
   const [authMode, setAuthMode] = useState<"login" | "signup">("login")
   const [authUsername, setAuthUsername] = useState("")
@@ -49,8 +51,7 @@ export default function App() {
   const [output, setOutput] = useState("")
   const [language, setLanguage] = useState("javascript")
   const [doc, setDoc] = useState(() => new Y.Doc())
-  const [remoteCursor, setRemoteCursor] = useState<{ line: number; column: number } | null>(null)
-  const [userCount, setUserCount] = useState(0)
+  const [collaborators, setCollaborators] = useState<Collaborator[]>([])
   const [projects, setProjects] = useState<Project[]>([])
   const [project, setProject] = useState<Project | null>(null)
   const [files, setFiles] = useState<WorkspaceFile[]>([])
@@ -60,7 +61,9 @@ export default function App() {
   const docRef = useRef(doc)
   const activeRoomRef = useRef<string | null>(null)
   const lastCursorRef = useRef("")
-  const remoteCursorUserRef = useRef<string | null>(null)
+  const lastCursorSentAtRef = useRef(0)
+  const pendingCursorRef = useRef<{ line: number; column: number } | null>(null)
+  const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!token) return
@@ -91,6 +94,10 @@ export default function App() {
     }
   }, [doc])
 
+  useEffect(() => () => {
+    if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
+  }, [])
+
   const authenticate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setError("")
@@ -103,6 +110,7 @@ export default function App() {
       const data = await response.json() as AuthResponse
       if (!response.ok) throw new Error(data.error || "Authentication failed.")
       setToken(data.token)
+      setCurrentUserId(data.user.id)
       setUsername(data.user.username)
       setAuthPassword("")
     } catch (err) {
@@ -232,6 +240,12 @@ export default function App() {
     wsRef.current = null
     activeRoomRef.current = null
     previousSocket?.close()
+    if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
+    cursorTimerRef.current = null
+    pendingCursorRef.current = null
+    lastCursorSentAtRef.current = 0
+    lastCursorRef.current = ""
+    setCollaborators([])
     setError("")
     setStatus("connecting")
     try {
@@ -290,19 +304,21 @@ export default function App() {
         }
         activeRoomRef.current = normalizedRoom
         setRoomId(normalizedRoom)
-        setUserCount(data.count ?? 1)
         setStatus("connected")
         setJoined(true)
-        setRemoteCursor(null)
         lastCursorRef.current = ""
-        remoteCursorUserRef.current = null
         return
       }
-      if (data.type === "users") setUserCount(data.count ?? 0)
-      if (data.type === "user-left" && data.userId === remoteCursorUserRef.current) {
-        setRemoteCursor(null)
-        remoteCursorUserRef.current = null
+      if (data.type === "presence-state" && Array.isArray(data.collaborators)) setCollaborators(data.collaborators)
+      if (data.type === "presence-update" && data.collaborator) {
+        setCollaborators((current) => {
+          const found = current.some((collaborator) => collaborator.userId === data.collaborator!.userId)
+          return found
+            ? current.map((collaborator) => collaborator.userId === data.collaborator!.userId ? data.collaborator! : collaborator)
+            : [...current, data.collaborator!]
+        })
       }
+      if (data.type === "presence-remove" && data.userId) setCollaborators((current) => current.filter((collaborator) => collaborator.userId !== data.userId))
       if (data.type === "code-update") {
         setError("The server is using an outdated collaboration protocol. Refresh the application.")
         ws.close()
@@ -314,18 +330,13 @@ export default function App() {
           setError("The server sent an invalid document update.")
         }
       }
-      if (data.type === "cursor-update" && Number.isInteger(data.line) && Number.isInteger(data.column)) {
-        setRemoteCursor({ line: data.line!, column: data.column! })
-        remoteCursorUserRef.current = data.userId ?? null
-      }
     }
     ws.onerror = () => setError("Could not connect to the collaboration server.")
     ws.onclose = () => {
       if (wsRef.current !== ws) return
       setStatus("disconnected")
-      setUserCount(0)
+      setCollaborators([])
       activeRoomRef.current = null
-      setRemoteCursor(null)
       setError((current) => current || "Connection closed. Reconnect to continue collaborating.")
     }
   }
@@ -335,7 +346,26 @@ export default function App() {
     const position = `${line}:${column}`
     if (position === lastCursorRef.current) return
     lastCursorRef.current = position
-    wsRef.current.send(JSON.stringify({ type: "cursor-update", roomId, line, column }))
+    const cursor = { line, column }
+    const sendCursor = (value: typeof cursor) => {
+      const ws = wsRef.current
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "presence-update", cursor: value }))
+      lastCursorSentAtRef.current = Date.now()
+    }
+    const elapsed = Date.now() - lastCursorSentAtRef.current
+    if (elapsed >= 50) {
+      sendCursor(cursor)
+      return
+    }
+    pendingCursorRef.current = cursor
+    if (!cursorTimerRef.current) {
+      cursorTimerRef.current = setTimeout(() => {
+        cursorTimerRef.current = null
+        const pending = pendingCursorRef.current
+        pendingCursorRef.current = null
+        if (pending) sendCursor(pending)
+      }, 50 - elapsed)
+    }
   }
 
   const leaveRoom = () => {
@@ -347,10 +377,11 @@ export default function App() {
     setDoc(emptyDoc)
     setJoined(false)
     setStatus("disconnected")
-    setUserCount(0)
+    if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
+    cursorTimerRef.current = null
+    pendingCursorRef.current = null
+    setCollaborators([])
     setOutput("")
-    setRemoteCursor(null)
-    remoteCursorUserRef.current = null
     setActiveFile(null)
     setError("")
   }
@@ -383,6 +414,7 @@ export default function App() {
       setError("Could not reach the server to revoke this session. The local session was cleared; server-side expiry is one hour.")
     } finally {
       setToken("")
+      setCurrentUserId("")
       setUsername("")
       setProjects([])
       setProject(null)
@@ -421,6 +453,16 @@ export default function App() {
       setError("Could not copy the room ID. Copy it manually.")
     }
   }
+
+  const remoteCursors = collaborators
+    .filter((collaborator) => collaborator.userId !== currentUserId && collaborator.fileId === (activeFile?.id ?? null) && collaborator.cursor)
+    .map((collaborator) => ({
+      userId: collaborator.userId,
+      username: collaborator.username,
+      color: collaborator.color,
+      line: collaborator.cursor!.line,
+      column: collaborator.cursor!.column,
+    }))
 
   if (!token) {
     return <main className="join-screen">
@@ -484,7 +526,7 @@ export default function App() {
       <div className="room-details"><span>{project?.name ?? "Room"}</span><code>{activeFile?.path ?? roomId}</code>{!project && <button className="secondary" onClick={copyRoomId}>Copy ID</button>}</div>
       <div className="toolbar">
         <span className={`connection ${status}`}><i />{status === "connected" ? "Connected" : status === "connecting" ? "Connecting" : "Disconnected"}</span>
-        <span className="user-count">{userCount} {userCount === 1 ? "person" : "people"}</span>
+        <span className="user-count">{collaborators.length} online</span>
         <input aria-label="Invite username" placeholder="Invite username" value={inviteUsername} onChange={(event) => setInviteUsername(event.target.value)} />
         <button className="secondary" disabled={!inviteUsername.trim()} onClick={inviteMember}>Invite</button>
         <select aria-label="Language" value={language} onChange={(event) => setLanguage(event.target.value)}>
@@ -501,7 +543,11 @@ export default function App() {
       {project && <aside className="file-explorer"><div className="explorer-heading"><span>EXPLORER</span><button title="New file" aria-label="New file" onClick={createFile}>+</button></div><div className="explorer-project">{project.name}</div>
         {files.map((file) => <div className={`explorer-file${activeFile?.id === file.id ? " selected" : ""}`} key={file.id} style={{ paddingLeft: `${8 + Math.max(0, file.path.split("/").length - 1) * 12}px` }}><button title={file.path} onClick={() => openFile(file)}>{file.path.split("/").at(-1)}</button><span><button aria-label={`Rename ${file.path}`} title="Rename" onClick={() => renameFile(file)}>✎</button><button aria-label={`Delete ${file.path}`} title="Delete" onClick={() => deleteFile(file)}>×</button></span></div>)}
       </aside>}
-      <div className="editor-container"><CodeEditor doc={doc} language={language} remoteCursor={remoteCursor} onCursorMove={updateCursor} /></div>
+      <aside className="collaborator-panel"><div className="collaborator-heading">Collaborators <span>{collaborators.length}</span></div>
+        {collaborators.map((collaborator) => <div className="collaborator-row" key={collaborator.userId}><i style={{ backgroundColor: collaborator.color }} /><div><strong>{collaborator.username}{collaborator.userId === currentUserId ? " (you)" : ""}</strong><span>{collaborator.filePath ?? "Room"}{collaborator.cursor ? ` · line ${collaborator.cursor.line}` : ""}</span></div></div>)}
+        {!collaborators.length && <p className="collaborator-empty">No one else is online.</p>}
+      </aside>
+      <div className="editor-container"><CodeEditor doc={doc} language={language} remoteCursors={remoteCursors} onCursorMove={updateCursor} /></div>
       <aside className="output-container"><div className="output-title">Output</div><pre>{output || "Run your code to see output here."}</pre></aside>
     </section>
   </main>

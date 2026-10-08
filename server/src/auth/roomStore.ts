@@ -61,6 +61,15 @@ export async function hasRoomAccess(roomId: string, userId: string) {
   return Boolean(await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }))
 }
 
+export async function getRoomPresenceContext(roomId: string) {
+  const room = await prisma.room.findUnique({
+    where: { id: roomId },
+    select: { projectId: true, file: { select: { id: true, path: true } } },
+  })
+  if (!room) return null
+  return { projectId: room.projectId, fileId: room.file?.id ?? null, filePath: room.file?.path ?? null }
+}
+
 export async function loadRoomDocument(roomId: string) {
   const updates = await prisma.documentUpdate.findMany({ where: { roomId }, orderBy: { id: "asc" }, select: { update: true } })
   const doc = new Y.Doc()

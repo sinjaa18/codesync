@@ -11,7 +11,8 @@ const remoteOrigin = {}
 const prisma = new PrismaClient()
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
 const decode = (value: string) => new Uint8Array(Buffer.from(value, "base64"))
-type Message = { type: string; message?: string; update?: string; stateVector?: string; count?: number; userId?: string; line?: number; column?: number }
+type Presence = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: { line: number; column: number } | null; online: boolean }
+type Message = { type: string; message?: string; update?: string; stateVector?: string; count?: number; userId?: string; collaborator?: Presence; collaborators?: Presence[]; cursor?: { line: number; column: number } | null }
 
 function readMessage(raw: WebSocket.RawData): Message | null {
   try {
@@ -21,12 +22,12 @@ function readMessage(raw: WebSocket.RawData): Message | null {
   }
 }
 
-function nextMessage(ws: WebSocket, type: string, timeoutMs = 3_000): Promise<Message> {
+function nextMessage(ws: WebSocket, type: string, timeoutMs = 3_000, matches: (message: Message) => boolean = () => true): Promise<Message> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => finish(new Error(`Timed out waiting for ${type}`)), timeoutMs)
     const onMessage = (raw: WebSocket.RawData) => {
       const message = readMessage(raw)
-      if (message?.type === type) finish(undefined, message)
+      if (message?.type === type && matches(message)) finish(undefined, message)
     }
     const onClose = () => finish(new Error(`Socket closed while waiting for ${type}`))
     const finish = (error?: Error, message?: Message) => {
@@ -94,7 +95,7 @@ async function signup(username: string) {
   return (await response.json()) as { token: string; user: { id: string; username: string } }
 }
 
-async function connectPeer(doc: Y.Doc, roomId: string, token: string): Promise<{ peer: Peer; count: number }> {
+async function connectPeer(doc: Y.Doc, roomId: string, token: string): Promise<{ peer: Peer; count: number; presence: Presence[] }> {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`)
   await new Promise<void>((resolve, reject) => {
     ws.once("open", resolve)
@@ -127,14 +128,16 @@ async function connectPeer(doc: Y.Doc, roomId: string, token: string): Promise<{
   ws.send(JSON.stringify({ type: "authenticate", token }))
   await authenticatedMessage
   const joinedMessage = nextMessage(ws, "joined")
+  const presenceState = nextMessage(ws, "presence-state")
   ws.send(JSON.stringify({ type: "join", roomId, stateVector: encode(Y.encodeStateVector(doc)) }))
   const response = await joinedMessage
+  const currentPresence = await presenceState
   assert.ok(response.update && response.stateVector, "join acknowledgement includes Yjs state and vector")
   Y.applyUpdate(doc, decode(response.update), remoteOrigin)
   joined = true
   const missing = Y.encodeStateAsUpdate(doc, decode(response.stateVector))
   if (missing.length > 2) sendUpdate(missing)
-  return { peer: { ws, doc, roomId, sendUpdate }, count: response.count ?? 0 }
+  return { peer: { ws, doc, roomId, sendUpdate }, count: response.count ?? 0, presence: currentPresence.collaborators ?? [] }
 }
 
 async function assertSocketRequiresAuthentication() {
@@ -249,11 +252,13 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
 
   assert.equal(first.ws.readyState, WebSocket.OPEN)
   assert.equal(second.ws.readyState, WebSocket.OPEN)
-  const cursorReceived = nextMessage(second.ws, "cursor-update")
-  first.ws.send(JSON.stringify({ type: "cursor-update", roomId: sharedRoom, line: 2, column: 4 }))
+  const cursorReceived = nextMessage(second.ws, "presence-update")
+  first.ws.send(JSON.stringify({ type: "presence-update", cursor: { line: 2, column: 4 } }))
   const cursor = await cursorReceived
-  assert.equal(cursor.line, 2)
-  assert.equal(cursor.column, 4)
+  assert.equal(cursor.collaborator?.userId, ownerAuth.user.id, "the server derives collaborator identity from the authenticated socket")
+  assert.equal(cursor.collaborator?.username, ownerName)
+  assert.equal(cursor.collaborator?.cursor?.line, 2)
+  assert.equal(cursor.collaborator?.cursor?.column, 4)
 
   const leaveReceived = nextMessage(second.ws, "user-left")
   const closed = new Promise<void>((resolve) => first.ws.once("close", () => resolve()))
@@ -289,15 +294,104 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.ok(file.roomId, "each new file gets an isolated collaboration room")
   const otherFileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/other.ts" })
   assert.equal(otherFileResponse.status, 201)
-  const otherFile = await otherFileResponse.json() as { roomId: string }
+  const otherFile = await otherFileResponse.json() as { id: string; path: string; roomId: string }
+  const thirdFileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/third.ts" })
+  assert.equal(thirdFileResponse.status, 201)
+  const thirdFile = await thirdFileResponse.json() as { id: string; path: string; roomId: string }
   assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "../secrets.txt" })).status, 400, "file paths reject traversal")
   assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "src/main.ts" })).status, 409, "duplicate file paths are rejected")
   const guestProjectPeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
   peers.push(guestProjectPeer.peer)
   assert.equal(guestProjectPeer.peer.doc.getText("code").toString(), "", "a project member can join the file document")
+  assert.deepEqual(guestProjectPeer.presence.map(({ userId }) => userId), [guestAuth.user.id], "new collaborators receive the current presence snapshot")
+  const ownerOnOtherFileUpdate = nextMessage(guestProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
   const otherFilePeer = await connectPeer(new Y.Doc(), otherFile.roomId, ownerToken)
   peers.push(otherFilePeer.peer)
+  const ownerOnOtherFile = (await ownerOnOtherFileUpdate).collaborator!
+  assert.equal(ownerOnOtherFile.userId, ownerAuth.user.id)
+  assert.equal(ownerOnOtherFile.username, ownerName)
+  assert.equal(ownerOnOtherFile.fileId, otherFile.id, "project collaborators see each other's active file")
+  assert.equal(ownerOnOtherFile.filePath, otherFile.path)
+  let crossFileCursorSeen = false
+  const onCrossFileMessage = (raw: WebSocket.RawData) => {
+    const message = readMessage(raw)
+    if (message?.type === "presence-update" && message.collaborator?.userId === ownerAuth.user.id && message.collaborator.cursor) crossFileCursorSeen = true
+  }
+  guestProjectPeer.peer.ws.on("message", onCrossFileMessage)
+  otherFilePeer.peer.ws.send(JSON.stringify({ type: "presence-update", cursor: { line: 4, column: 2 } }))
+  await new Promise((resolve) => setTimeout(resolve, 75))
+  guestProjectPeer.peer.ws.off("message", onCrossFileMessage)
+  assert.equal(crossFileCursorSeen, false, "cursor coordinates are only sent to collaborators on that file")
   await assertSocketRoomDenied(outsiderAuth.token, file.roomId)
+  assert.equal((await api(`/projects/${project.id}/invites`, ownerToken, { username: outsiderName })).status, 204)
+  const outsiderProjectPeer = await connectPeer(new Y.Doc(), file.roomId, outsiderAuth.token)
+  peers.push(outsiderProjectPeer.peer)
+  assert.equal(outsiderProjectPeer.presence.length, 3, "presence state contains all current project collaborators")
+  assert.deepEqual(new Set(outsiderProjectPeer.presence.map(({ userId }) => userId)), new Set([ownerAuth.user.id, guestAuth.user.id, outsiderAuth.user.id]))
+  const ownerOnFileUpdateForGuest = nextMessage(guestProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+  const ownerOnFileUpdateForOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+  const ownerOnFilePeer = await connectPeer(new Y.Doc(), file.roomId, ownerToken)
+  peers.push(ownerOnFilePeer.peer)
+  const [ownerForGuest, ownerForOutsider] = await Promise.all([ownerOnFileUpdateForGuest, ownerOnFileUpdateForOutsider])
+  assert.equal(ownerForGuest.collaborator?.fileId, file.id, "switching files updates project-wide active-file presence")
+  assert.equal(ownerForOutsider.collaborator?.filePath, "src/main.ts")
+  assert.equal(ownerOnFilePeer.presence.filter(({ userId }) => userId === ownerAuth.user.id).length, 1, "a user has one presence entry after switching files")
+  assert.equal(ownerOnFilePeer.presence.find(({ userId }) => userId === ownerAuth.user.id)?.color, ownerForGuest.collaborator?.color)
+
+  const ownerCursorForGuest = nextMessage(guestProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+  const ownerCursorForOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+  ownerOnFilePeer.peer.ws.send(JSON.stringify({ type: "presence-update", cursor: { line: 2, column: 5 } }))
+  const [ownerCursorGuest, ownerCursorOutsider] = await Promise.all([ownerCursorForGuest, ownerCursorForOutsider])
+  assert.equal(ownerCursorGuest.collaborator?.userId, ownerAuth.user.id)
+  assert.deepEqual(ownerCursorOutsider.collaborator?.cursor, { line: 2, column: 5 })
+  const guestCursorForOwner = nextMessage(ownerOnFilePeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === guestAuth.user.id)
+  const guestCursorForOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === guestAuth.user.id)
+  guestProjectPeer.peer.ws.send(JSON.stringify({ type: "presence-update", cursor: { line: 7, column: 3 } }))
+  assert.deepEqual((await guestCursorForOwner).collaborator?.cursor, { line: 7, column: 3 }, "a second user's cursor remains independent")
+  const outsiderCursorForOwner = nextMessage(ownerOnFilePeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === outsiderAuth.user.id)
+  const outsiderCursorForGuest = nextMessage(guestProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === outsiderAuth.user.id)
+  outsiderProjectPeer.peer.ws.send(JSON.stringify({ type: "presence-update", cursor: { line: 12, column: 8 } }))
+  assert.deepEqual((await outsiderCursorForOwner).collaborator?.cursor, { line: 12, column: 8 }, "a third user's cursor remains independent")
+  assert.equal((await outsiderCursorForGuest).collaborator?.username, outsiderName)
+  const spoofIgnored = nextMessage(ownerOnFilePeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === outsiderAuth.user.id && message.collaborator.cursor?.line === 99)
+  outsiderProjectPeer.peer.ws.send(JSON.stringify({ type: "presence-update", userId: ownerAuth.user.id, cursor: { line: 99, column: 99 } }))
+  const spoofedCursor = await spoofIgnored
+  assert.equal(spoofedCursor.collaborator?.userId, outsiderAuth.user.id, "the server ignores a client-supplied identity and uses the authenticated user")
+  assert.deepEqual(spoofedCursor.collaborator?.cursor, { line: 99, column: 99 })
+
+  let reconnectingOwner = ownerOnFilePeer.peer
+  const stableColor = ownerForGuest.collaborator?.color
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const removedForGuest = nextMessage(guestProjectPeer.peer.ws, "presence-remove")
+    const removedForOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-remove")
+    const socketClosed = new Promise<void>((resolve) => reconnectingOwner.ws.once("close", () => resolve()))
+    reconnectingOwner.ws.close()
+    await Promise.all([socketClosed, removedForGuest, removedForOutsider])
+    const reappearedForGuest = nextMessage(guestProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+    const reappearedForOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+    const reconnectedOwner = await connectPeer(new Y.Doc(), file.roomId, ownerToken)
+    peers.push(reconnectedOwner.peer)
+    assert.equal(reconnectedOwner.presence.filter(({ userId }) => userId === ownerAuth.user.id).length, 1, "reconnect does not duplicate presence entries")
+    assert.equal(reconnectedOwner.presence.find(({ userId }) => userId === ownerAuth.user.id)?.color, stableColor, "user color remains stable across reconnects")
+    assert.equal((await reappearedForGuest).collaborator?.userId, ownerAuth.user.id)
+    assert.equal((await reappearedForOutsider).collaborator?.userId, ownerAuth.user.id)
+    reconnectingOwner = reconnectedOwner.peer
+  }
+
+  for (const targetFile of [otherFile, thirdFile, file]) {
+    const removedFromGuest = nextMessage(guestProjectPeer.peer.ws, "presence-remove", 3_000, (message) => message.userId === ownerAuth.user.id)
+    const removedFromOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-remove", 3_000, (message) => message.userId === ownerAuth.user.id)
+    const activeForGuest = nextMessage(guestProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+    const activeForOutsider = nextMessage(outsiderProjectPeer.peer.ws, "presence-update", 3_000, (message) => message.collaborator?.userId === ownerAuth.user.id)
+    const switchedOwner = await connectPeer(new Y.Doc(), targetFile.roomId, ownerToken)
+    peers.push(switchedOwner.peer)
+    await Promise.all([removedFromGuest, removedFromOutsider])
+    assert.equal((await activeForGuest).collaborator?.fileId, targetFile.id, "file switching broadcasts the active file")
+    assert.equal((await activeForOutsider).collaborator?.cursor, null, "switching clears stale cursor state")
+    assert.equal(switchedOwner.presence.filter(({ userId }) => userId === ownerAuth.user.id).length, 1)
+    reconnectingOwner = switchedOwner.peer
+  }
+
   guestProjectPeer.peer.doc.getText("code").insert(0, "export const ready = true")
   await waitFor(async () => (await prisma.file.findUnique({ where: { id: file.id } }))?.content === "export const ready = true")
   assert.equal(otherFilePeer.peer.doc.getText("code").toString(), "", "edits stay isolated to their file")
@@ -308,6 +402,18 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   assert.equal(disposable.status, 201, "invited editors can create files")
   const disposableFile = await disposable.json() as { id: string }
   assert.equal((await api(`/projects/${project.id}/files/${disposableFile.id}`, guestAuth.token, undefined, "DELETE")).status, 204, "files can be deleted")
+
+  const removeOutsider = nextMessage(guestProjectPeer.peer.ws, "presence-remove")
+  const outsiderClosed = new Promise<void>((resolve) => outsiderProjectPeer.peer.ws.once("close", () => resolve()))
+  outsiderProjectPeer.peer.ws.close()
+  await Promise.all([removeOutsider, outsiderClosed])
+  const privateProjectResponse = await api("/projects", outsiderAuth.token, { name: `${prefix}private` })
+  const privateProject = await privateProjectResponse.json() as { id: string }
+  const privateFileResponse = await api(`/projects/${privateProject.id}/files`, outsiderAuth.token, { path: "private.js" })
+  const privateFile = await privateFileResponse.json() as { roomId: string }
+  const unrelatedPeer = await connectPeer(new Y.Doc(), privateFile.roomId, outsiderAuth.token)
+  peers.push(unrelatedPeer.peer)
+  assert.deepEqual(unrelatedPeer.presence.map(({ userId }) => userId), [outsiderAuth.user.id], "presence never crosses project boundaries")
 
   for (const peer of peers) {
     if (peer.ws.readyState === WebSocket.OPEN) peer.ws.close()

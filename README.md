@@ -41,7 +41,7 @@ Open the application in two browser tabs, join the same room, and start editing.
 | 🔑 Room authorization | Owners invite registered usernames before they can join |
 | ⚡ Real-time editing | Code changes are synchronized through WebSockets |
 | 🎯 Cursor sharing | Remote cursor positions are synchronized between participants |
-| 👥 Presence | Shows the number of connected participants |
+| 👥 Presence | Shows collaborator usernames, stable colors, active files, and remote cursors |
 | 🧑‍💻 Monaco Editor | Full editor experience with syntax highlighting |
 | 🌐 Multi-language | JavaScript, TypeScript, Python, C++, and Java |
 | ▶️ Code execution | Execute code through Judge0 Community Edition |
@@ -288,7 +288,7 @@ npm test
 
 The test requires `DATABASE_URL` to point to a migrated PostgreSQL database. It creates uniquely named test data and deletes its test users afterward.
 
-It checks signup, duplicate signup, invalid login, protected endpoints, room and project invitations, file creation/rename/deletion, path validation, outsider denial, per-file isolation, unauthorized WebSocket joins, logout revocation, concurrent edits, late joins, cursor events, disconnect cleanup, and restart recovery. On the local Windows/PostgreSQL 18 run, 10 sequential loopback Yjs updates measured p50 6.14 ms and p95 18.24 ms. This small sample is not a load test.
+It checks signup, duplicate signup, invalid login, protected endpoints, room and project invitations, file creation/rename/deletion, path validation, outsider denial, per-file isolation, three-user presence and cursors, identity spoofing, active-file switching, disconnect/reconnect cleanup, concurrent edits, late joins, logout revocation, and restart recovery. On the local Windows/PostgreSQL 18 run, 10 sequential loopback Yjs updates measured p50 6.19 ms and p95 9.31 ms. This small sample is not a load test.
 
 Other deployment and Judge0 checks below reflect prior project verification and are not part of this collaboration integration test.
 
@@ -298,7 +298,7 @@ Verified functionality includes:
 - backend TypeScript build
 - WebSocket connection establishment
 - room joining
-- participant counts
+- collaborator usernames, stable colors, active files, and per-user cursors
 - concurrent Yjs code synchronization
 - cursor synchronization
 - room isolation
@@ -576,14 +576,16 @@ authenticate { token }
 authenticated { user }
 join (includes Yjs state vector)
 joined (includes Yjs update and state vector)
+presence-state { collaborators }
+presence-update { cursor }
+presence-remove { userId }
 doc-update (incremental Yjs update)
-cursor-update
 users (participant count)
 user-left
 ```
 
 The server returns the update missing from the joining client's state vector. It appends received Yjs updates to PostgreSQL and replays them to rebuild the in-memory document cache when a room is opened. Project file rooms authorize through project membership; the legacy room flow continues to use room membership.
-The authenticated account supplies the user identity; clients cannot choose an identity in cursor or document messages.
+The authenticated account supplies the user identity; any client-supplied identity field is ignored. The server derives username, stable color, project, and active file from the authenticated socket and its authorized room membership.
 
 ---
 
@@ -609,7 +611,7 @@ Active WebSocket connections and document caches are process-local. Multiple bac
 
 ### Presence
 
-Only participant count and a single remote cursor are currently represented.
+Presence is ephemeral in-memory WebSocket state and is never written to PostgreSQL. Project collaborators receive usernames, a deterministic user color, and active file paths; cursor coordinates are sent only to collaborators editing that same file. Cursor updates are throttled to at most one every 50 ms per client. A user has one active connection per project; opening the same project in another tab moves that user's presence to the newer connection. Remote text selections are not implemented.
 
 ### Execution
 
@@ -631,7 +633,6 @@ Current
 Future
   │
   ├── Yjs update compaction and history browsing
-  ├── Per-user cursor and active-file presence
   ├── Redis-based distributed presence
   ├── Multi-instance WebSocket scaling
   ├── Distributed rate limiting

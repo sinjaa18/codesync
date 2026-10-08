@@ -15,15 +15,13 @@ export type DocumentUpdateMessage={
   update:string
 }
 
-export type CursorUpdateMessage={
-  type:"cursor-update"
-  roomId:string
-  line:number
-  column:number
+export type PresenceUpdateMessage={
+  type:"presence-update"
+  cursor:{ line:number; column:number } | null
 }
 
 export type WSMessage=
 | AuthenticateMessage
 | JoinMessage
 | DocumentUpdateMessage
-| CursorUpdateMessage
+| PresenceUpdateMessage
