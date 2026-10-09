@@ -1,7 +1,3 @@
-﻿
-> server@1.0.0 benchmark
-> node --env-file-if-exists=.env.test.local --import tsx scripts/benchmark.ts --allow-local-target --max-clients 25 --requests 30 --repetitions 3
-
 {
   "benchmark": "CodeSync local performance baseline",
   "location": "local only; not a production capacity claim",

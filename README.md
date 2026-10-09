@@ -1,830 +1,263 @@
-# ⚡ CodeSync
+# CodeSync
 
-### Real-time collaborative code editor built with React, TypeScript, Monaco Editor, WebSockets, and Judge0.
+CodeSync is a browser-based collaborative code workspace. It brings project files, shared editing, collaborator presence, room chat, and sandboxed code execution into one application. It reduces the coordination overhead of editing code together by synchronizing document changes and presence in real time while keeping room access and persisted state on the server.
 
-[![Live Demo](https://img.shields.io/badge/Live-Demo-success?style=flat-square)](https://codesync-nu-ashen.vercel.app/)
-[![Frontend](https://img.shields.io/badge/Frontend-Vercel-black?style=flat-square&logo=vercel)](https://vercel.com/)
-[![Backend](https://img.shields.io/badge/Backend-Render-46E3B7?style=flat-square&logo=render)](https://render.com/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?style=flat-square&logo=typescript)](https://www.typescriptlang.org/)
-[![React](https://img.shields.io/badge/React-TypeScript-61DAFB?style=flat-square&logo=react)](https://react.dev/)
-[![WebSocket](https://img.shields.io/badge/Realtime-WebSocket-purple?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
+[Open the deployed application](https://codesync-nu-ashen.vercel.app/) · [Source repository](https://github.com/sinjaa18/codesync)
 
-> **Write code together. See changes instantly. Run it safely.**
+## Features
 
-CodeSync is a browser-based collaborative code workspace with project file trees, per-file Monaco editing, Yjs synchronization, room and project access controls, and code execution through the Judge0 sandbox API.
+- Account signup and login with server-managed sessions.
+- Shared standalone rooms and project workspaces with a file tree.
+- Per-file Monaco editing synchronized through Yjs over WebSockets.
+- Collaborator presence, active-file information, cursor sharing, and room chat.
+- Room invitations and owner-reviewed join requests.
+- Project roles: OWNER and EDITOR project memberships allow collaboration. VIEWER preserves project-file reads but grants no room access; an explicit room membership is a separate room-level grant.
+- Persistent projects, file contents, room membership, chat, join requests, and Yjs updates in PostgreSQL.
+- Owner-only project deletion and coordinated room cleanup when a file or project is deleted.
+- Authenticated execution of JavaScript, TypeScript, Python, C++, and Java through a configured Judge0 service.
+- Health and database-readiness endpoints.
 
----
+## Screenshots
 
-## 🌐 Live Demo
+![Room join screen](screenshots/join-room.png)
 
-### 🚀 Try CodeSync
+![Collaborative editor](screenshots/editor-output.png)
 
-**https://codesync-nu-ashen.vercel.app/**
+## Technology choices
 
-Open the application in two browser tabs, join the same room, and start editing.
+| Technology | Role in CodeSync |
+| --- | --- |
+| React and TypeScript | Build the interactive browser UI and keep client state/API flows typed. |
+| Monaco Editor | Provide code-focused editing and language-aware editor behavior. |
+| Yjs and y-monaco | Merge concurrent text edits and bind the shared document to Monaco. |
+| WebSockets (ws) | Carry bidirectional document, presence, chat, and request notifications with low-overhead live delivery. |
+| Node.js and Express | Serve the HTTP API and host the WebSocket endpoint on the same server. |
+| PostgreSQL and Prisma | Keep product and collaboration records durable; use Prisma for typed database access and migrations. |
+| Zod | Reject malformed HTTP inputs and WebSocket messages at the server boundary. |
+| Judge0 | Execute submitted code in an external sandbox instead of evaluating it inside the application process. |
 
-### 💻 Source Code
+## Architecture
 
-**https://github.com/sinjaa18/codesync**
+The browser uses HTTP for account, project, room, chat-history, and execution requests. A WebSocket on the same backend server carries authenticated collaboration events. PostgreSQL is the durable source for saved room updates and product records; active Yjs documents and sockets are held in backend process memory.
 
----
+```mermaid
+flowchart LR
+    Browser["React + Monaco + Yjs"]
+    API["Express HTTP API"]
+    WS["ws WebSocket server"]
+    DB[("PostgreSQL via Prisma")]
+    Judge["Configured Judge0 service"]
 
-## ✨ Features
+    Browser -->|"HTTPS: auth, projects, rooms, history"| API
+    Browser <-->|"WSS: authenticate, join, Yjs, presence, chat"| WS
+    API <-->|"authorization and persisted records"| DB
+    WS <-->|"load and persist Yjs updates, chat"| DB
+    API -->|"validated code and stdin"| Judge
+    Judge -->|"execution result"| API
+    API -->|"JSON response"| Browser
+```
 
-| Feature | Description |
-|---|---|
-| 🏠 Room-based collaboration | Join a shared workspace using a room ID |
-| 🗂️ Project workspaces | Create projects with a focused file explorer |
-| 📄 Multi-file editing | Create, rename, delete, and open persistent project files |
-| 🤝 Per-file collaboration | Each project file has an isolated persistent Yjs document |
-| 🔐 Accounts and sessions | Sign up, sign in, and revoke the current session |
-| 🔑 Room authorization | Owners invite registered usernames before they can join |
-| ⚡ Real-time editing | Code changes are synchronized through WebSockets |
-| 🎯 Cursor sharing | Remote cursor positions are synchronized between participants |
-| 👥 Presence | Shows collaborator usernames, stable colors, active files, and remote cursors |
-| 💬 Room chat | Expandable per-room chat with PostgreSQL history and authenticated realtime delivery |
-| 🧩 Collapsible collaborators | Expand or collapse the online collaborators and pending request panel |
-| 🗑️ Owner project deletion | Confirmed owner-only deletion removes project files, rooms, updates, requests, and chat history |
-| 🧑‍💻 Monaco Editor | Full editor experience with syntax highlighting |
-| 🌐 Multi-language | JavaScript, TypeScript, Python, C++, and Java |
-| ▶️ Code execution | Execute code through Judge0 Community Edition |
-| 🔄 Reconnection handling | Detects closed connections and allows reconnecting |
-| 📋 Room sharing | Copy a room ID to invite another participant |
-| 🛡️ Server-side validation | Execution requests are validated before submission |
-| 🚫 No unsafe execution | User code is never evaluated inside the CodeSync server |
+See [docs/architecture.md](docs/architecture.md) for room lifecycle, authorization boundaries, synchronization, persistence, and deletion behavior.
 
----
+## Collaboration and recovery
 
-## 🖥️ Screenshots
+1. The client signs in over HTTP. The server issues a random opaque bearer session token; it is not a JWT. The session record stores the token hash and expiry in PostgreSQL.
+2. Before opening a room WebSocket, the client authenticates with that token. On a join request, the server checks current room or project membership against PostgreSQL.
+3. The server loads the room’s ordered Yjs updates into a Y.Doc (or reuses the active in-memory document), then returns the state missing from the client’s Yjs state vector.
+4. Clients send incremental Yjs updates. The server applies them, persists each update and the current project-file content, then broadcasts the update to other sockets in that room. Yjs merges concurrent edits.
+5. Presence and chat events use the authorized room connection. Chat history is loaded from PostgreSQL for authorized members.
+6. When the last socket leaves, the server drops the in-memory document. PostgreSQL retains the updates, so a later join reconstructs the document. Deleting a file or project fences new joins, closes active sockets, clears cached or loading room state, drains active persistence work, and removes the corresponding records.
 
-### Join a Room
+This is server-backed reconnect recovery, not an offline-first synchronization service. A reconnecting client reconciles its local Yjs state with the server, but the backend must be reachable to exchange state and persist new changes.
 
-![CodeSync Room](screenshots/join-room.png)
-
-### Collaborative Editor
-
-![CodeSync Editor](screenshots/editor-output.png)
-
----
-
-## 🏗️ Architecture
+## Repository layout
 
 ```text
-                         CodeSync
-                            │
-             ┌──────────────┴──────────────┐
-             │                             │
-             ▼                             ▼
-      React + Monaco                  REST API
-             │                             │
-             │ WebSocket                  │ POST /run
-             ▼                             ▼
-      Node.js + Express                Judge0 API
-             │
-             │
-             ▼
-      ws WebSocket Server
-             │
-             ▼
-      PostgreSQL via Prisma
+.
+├── client/
+│   ├── src/
+│   │   ├── App.tsx                 # Application state and API/WebSocket flows
+│   │   ├── components/CodeEditor.tsx
+│   │   └── joinRequest.ts          # Join approval status reconciliation
+│   ├── .env.example
+│   └── package.json
+├── server/
+│   ├── prisma/schema.prisma
+│   ├── prisma/migrations/
+│   ├── src/
+│   │   ├── auth/                   # Sessions and access control
+│   │   ├── collaboration/          # Room deletion lifecycle
+│   │   ├── execution/              # Judge0 integration
+│   │   ├── routes/
+│   │   └── index.ts                # Express and WebSocket server
+│   ├── scripts/                    # Test database guard and benchmark
+│   ├── test/unit/
+│   ├── test/integration/
+│   ├── .env.example
+│   └── package.json
+├── docs/
+│   ├── architecture.md
+│   └── performance-baseline.json
+├── screenshots/
+└── .github/workflows/ci.yml
 ```
 
-### Collaboration Flow
+## Local setup
 
-```text
-User A
-  │
-  │ doc-update (Yjs)
-  ▼
-WebSocket Server
-  │
-  ├── append Yjs update to PostgreSQL
-  │
-  └── broadcast to other members
-              │
-              ▼
-            User B
-```
+### Requirements
 
-### Code Execution Flow
+- Node.js 22 (the CI workflow uses Node.js 22).
+- npm.
+- PostgreSQL. CI uses PostgreSQL 16; the recorded local benchmark used PostgreSQL 18.6.
 
-```text
-Browser
-   │
-   │ POST /run
-   ▼
-Express Server
-   │
-   │ validate request
-   ▼
-Judge0
-   │
-   │ sandboxed execution
-   ▼
-Execution Result
-   │
-   ▼
-Browser Output Panel
-```
-
----
-
-## ⚡ How Realtime Collaboration Works
-
-CodeSync uses a simple room-based WebSocket architecture.
-
-When a user joins a room:
-
-```text
-Client
-  ↓
-join(roomId)
-  ↓
-Server registers socket
-  ↓
-Current room state returned
-  ↓
-Collaborative editing begins
-```
-
-CodeSync uses Yjs shared text and its Monaco binding. Editors exchange incremental document updates over the existing WebSocket room connection. Yjs merges concurrent edits; the server applies each update to the room document and relays it to the other participants.
-
-When a client joins, it sends a Yjs state vector. The server responds with the missing document update and its current state vector, allowing the client to reconcile offline edits after a reconnect.
-
-When code changes:
-
-```text
-Monaco Editor + Yjs binding
-     ↓
-incremental Yjs update
-     ↓
-doc-update
-     ↓
-WebSocket server
-     ↓
-apply update to the room Y.Doc
-     ↓
-broadcast to other users
-```
-
-Cursor movement follows a similar WebSocket event flow.
-
-Remote code updates are applied to the shared Yjs document without echoing them back to the server.
-
-### Room State
-
-```text
-Room ID
-   │
-   ├── connected sockets
-   └── latest code
-```
-
-When the last participant leaves, the in-memory document cache is dropped. The persisted Yjs updates remain in PostgreSQL and are replayed when the room is opened again.
-
----
-
-## 🧠 Engineering Decisions
-
-### Why WebSockets?
-
-HTTP is useful for request/response operations such as code execution, but collaboration requires continuous bidirectional communication.
-
-CodeSync therefore uses:
-
-```text
-WebSocket → realtime collaboration
-HTTP      → code execution
-```
-
-### Why Yjs?
-
-Yjs provides conflict-free merging for concurrent text edits and compact incremental updates. It keeps client documents reconcilable after temporary disconnects while using the existing WebSocket transport.
-
-This keeps the system small and understandable while demonstrating the fundamentals of:
-
-- WebSocket communication
-- room membership
-- event broadcasting
-- shared state
-- remote editor updates
-- connection lifecycle management
-
-### Why Not `eval()`?
-
-Executing arbitrary user code directly inside the application server would be unsafe.
-
-Instead:
-
-```text
-CodeSync Server
-      │
-      ▼
-Judge0 Sandbox
-      │
-      ▼
-User Program
-```
-
-The CodeSync backend never evaluates submitted source code itself.
-
----
-
-## ▶️ Supported Languages
-
-```text
-JavaScript
-TypeScript
-Python
-C++
-Java
-```
-
-Code execution is sent to the configured Judge0 service. CodeSync does not run submitted code in its own Node.js process. The API accepts JavaScript, TypeScript, Python, C++, and Java. The client loads this list from `GET /run/languages`.
-
-Each execution requires an authenticated session and allows source and standard input up to 10 KB each. A user can submit 10 executions per minute per backend process. The server enforces a 10 second total request deadline across submission and polling, and caps each Judge0 response at 128 KiB. Returned stdout, stderr, and compiler output are each limited to 16,000 characters.
-
----
-
-## 🔐 Security Considerations
-
-CodeSync is designed as a learning and portfolio-scale collaborative editor rather than a production-grade multi-tenant IDE.
-
-Current protections include:
-
-- Zod request validation
-- Scrypt password hashing and random bearer sessions with a one-hour expiry
-- Authentication rate limit of 10 attempts per IP per minute
-- Authenticated WebSocket sessions and server-owned collaborator identities
-- Owner-controlled room membership; execution and room APIs require authentication
-- Project owners can invite registered users; project members can access and edit files
-- strict server-side execution request validation and per-user execution rate limiting
-- external sandbox execution through Judge0 with network access disabled
-- server-owned resource limits: 3 seconds CPU, 5 seconds wall time, 128 MB memory, 32 MB stack, 10 processes/threads, and 1 MB maximum file size
-- bounded upstream response size, output size, and total request time
-- configurable allowed frontend origin
-- no direct server-side `eval()` or dynamic execution
-
-### Storage limitation
-
-Accounts, sessions, room membership, project metadata, file records, chat messages, pending join requests, and Yjs updates are stored in PostgreSQL. Active WebSocket connections, revocation event listeners, and document caches remain process-local. Revocation and project-deletion events reach all applicable sockets in this single-process architecture, but events do not cross backend processes; realtime broadcasts and prompt revocation therefore require a single backend instance.
-
-The current authentication system does not include email verification, password reset, or multi-factor authentication.
-
-A future operations and deployment phase could add:
-
-```text
-Distributed rate limiting
-      ↓
-Stronger execution isolation
-```
-
----
-
-## 🧪 Verification
-
-### Continuous integration
-
-GitHub Actions runs on pushes to `main` and pull requests targeting `main`. It installs the server and client from their lockfiles, starts a disposable PostgreSQL 16 service with the dedicated `codesync_test` database, applies checked-in Prisma migrations, and runs the full unit and PostgreSQL integration test suite. It also runs server/test typechecks, server and client production builds, and client lint. The CI database is isolated from local development and production settings.
-
-### Test database setup
-
-The complete test suite resets a **dedicated local PostgreSQL database** before integration tests. It will refuse to reset a database unless its name is exactly `codesync_test` and its host is `localhost`, `127.0.0.1`, or `::1`. Never point this URL at your development or production database.
-
-Create the dedicated database using your local PostgreSQL administrator account. For the `postgres` role used by the test URL template:
-
-```sql
-CREATE DATABASE codesync_test OWNER postgres;
-```
-
-Copy `server/.env.test.local.example` to `server/.env.test.local` and set the local password in that ignored file. Do not put the test URL in `server/.env`; that file is for application development settings. Test scripts load `.env.test.local` specifically, while the integration server keeps the test database URL inherited from the test process.
-
-```powershell
-Copy-Item server/.env.test.local.example server/.env.test.local
-# Edit server/.env.test.local and replace the password placeholder.
-```
-
-The test command drops and recreates the schema in that one local database, then applies the checked-in Prisma migrations. The database user must own the database. If PostgreSQL is unavailable or the URL is missing, tests stop with an actionable error; integration tests are never silently skipped.
-
-### Test commands
+### Install and configure
 
 Run from the repository root:
 
-```bash
-npm run test:unit
-npm run test:integration
-npm test
-npm run typecheck
-npm run build
-npm run lint
+```powershell
+npm ci --prefix server
+npm ci --prefix client
+Copy-Item server/.env.example server/.env
+Copy-Item client/.env.example client/.env
 ```
 
-`npm test` runs type checks, unit tests, resets the test database, applies migrations, and runs the PostgreSQL/WebSocket integration suite. `npm run test:integration` resets the same dedicated database before running integration tests. Unit tests do not need PostgreSQL. The integration test starts a local CodeSync server and WebSocket clients on temporary loopback ports. It uses a local HTTP Judge0 mock; no public Judge0 access or credentials are needed.
-
-To remove the test database when finished, connect as a PostgreSQL administrator and run:
+Create a local development database with your PostgreSQL administrator account. Choose a local password and use the same value in server/.env:
 
 ```sql
-DROP DATABASE codesync_test;
-```
-
-The integration suite covers signup/login/session revocation, project membership and file authorization, lifecycle and isolation, three-client WebSocket presence, cursors, concurrent Yjs updates, late join and reconnect state, persistent authorized chat, join-request approval/rejection/idempotency, project deletion cleanup and socket closure, execution validation/failures/rate limits/result isolation, and PostgreSQL-backed restart recovery. It records a small local Yjs synchronization latency sample as diagnostic output; it is not a scalability benchmark.
-
-The execution unit tests use injected Judge0 responses and cover resource settings, output normalization/truncation, the submission and polling deadline, status mapping, and malformed or oversized responses. Integration tests exercise the authenticated API with the local mock.
-
-Verified functionality includes:
-
-- frontend production build
-- backend TypeScript build
-- WebSocket connection establishment
-- room joining
-- collaborator usernames, stable colors, active files, and per-user cursors
-- concurrent Yjs code synchronization
-- cursor synchronization
-- room isolation
-- late-join code snapshots
-- malformed and invalid room messages
-- disconnect cleanup
-- bounded Judge0 runner behavior with mocked service responses
-- local authenticated `/run` API against the Judge0 mock
-- PostgreSQL/WebSocket integration suite (when run with the documented local test database)
-
-The production frontend is deployed on Vercel and the backend on Render. The authentication changes in this repository have not been deployed; the public deployment remains on its prior version until these changes are released there.
-
----
-
-## 📊 Performance Benchmark
-
-CodeSync includes a comprehensive local performance benchmark to measure HTTP throughput, WebSocket connection latency, PostgreSQL persistence, and collaborative CRDT (Yjs) propagation times.
-
-### Running the Benchmark
-
-The benchmark is strictly opt-in and designed to run only against a local test environment.
-
-```bash
-cd server
-npm run benchmark -- --allow-local-target --max-clients 25 --requests 30 --repetitions 3
-```
-
-### Safety Requirements
-
-To prevent accidental load against production or development environments, the benchmark enforces several strict safety requirements:
-- **Opt-in Flag**: Requires the `--allow-local-target` argument.
-- **Database Restrictions**: The `DATABASE_URL` must point to `localhost` or `127.0.0.1` and target a database named exactly `codesync_test`.
-- **No Resets**: The benchmark creates unique temporary users, projects, and files for its run, and cleans them up at the end. It **never resets or drops** the database.
-- **No Public Judge0**: It does not perform public Judge0 execution requests.
-
-### Scenarios and Methodology
-
-The harness tests the system across several dimensions:
-1. **HTTP Baseline**: Concurrency tests against `/projects` and `/projects/:projectId/files` endpoints.
-2. **PostgreSQL Persistence**: Measures the latency of the direct `persistRoomUpdate` transaction.
-3. **WebSocket Connections**: Measures connection establishment, authentication, and room join latencies.
-4. **Collaborative Editing (Yjs)**: Measures end-to-end client-to-peer delivery time for Yjs document updates. This is not just server processing time; it includes the network send, server-side persistence in PostgreSQL, and WebSocket broadcast to peers.
-5. **Presence**: Measures the delivery latency of cursor movement broadcasts.
-
-The benchmark tracks p50, p95, and (where sample size permits) p99 latencies, using a monotonic high-resolution clock (`performance.now()`). System-wide CPU and memory are sampled periodically, and execution aborts early if resources run low or error thresholds are crossed.
-
-### Environment and Parameters
-
-The recorded baseline (`docs/performance-baseline.json`) was generated in the following environment:
-- **OS**: Windows 11 (Windows_NT 10.0.26200 x64)
-- **Node.js**: v22.18.0
-- **PostgreSQL**: 18.6
-- **CPU**: AMD Ryzen 7 7730U (8 cores / 16 logical processors)
-- **Memory**: ~14.8 GB
-
-**Parameters used:** Up to 25 clients, 30 requests per repetition, 3 repetitions.
-
-### Measured Findings and Limitations
-
-- **HTTP Concurrency**: At 25 concurrent clients, the server handled ~680 requests/second with a p50 latency under 30ms and a p95 latency under 45ms for authorized list endpoints.
-- **WebSocket Setup**: Establishing 25 connections in parallel succeeded without failures; p50 room join times were typically under 20ms.
-- **Presence**: Cursor position updates broadcast to 5 clients had a p50 delivery time of ~1.3ms.
-- **Collaboration**: Yjs client-to-peer delivery (including persistence) maintained convergence without missed messages.
-- **Limitations**: This is a local test loopback baseline, not a distributed production capacity claim. Network latency is negligible in this test, and the single-instance backend architecture remains the scale bottleneck.
-
-### Concurrent Room-Join Fix
-
-During the development of the benchmark, a concurrent WebSocket room-join race condition was identified. The room's active socket set was looked up before an asynchronous `getRoomDoc` call, meaning simultaneous joins could overwrite each other's room membership, causing missed Yjs updates. The lookup was moved to after the `await`, and a regression integration test (`simultaneous-room-join`) was added to `server/test/integration/collaboration.test.ts` to ensure this condition is isolated and correctly handled. (No before/after load metrics are presented, as the pre-fix state resulted in test failures rather than slower performance).
-
----
-
-## 🛠️ Tech Stack
-
-### Frontend
-
-- React
-- TypeScript
-- Vite
-- Monaco Editor
-- Yjs
-- `y-monaco`
-
-### Backend
-
-- Node.js
-- TypeScript
-- Express
-- `ws`
-- Zod
-- Prisma ORM
-- PostgreSQL
-
-### Code Execution
-
-- Judge0 Community Edition API
-
-### Deployment
-
-- Vercel
-- Render
-
----
-
-## 📁 Project Structure
-
-```text
-CodeSync/
-│
-├── client/
-│   ├── src/
-│   │   ├── App.tsx
-│   │   ├── main.tsx
-│   │   └── ...
-│   ├── .env.example
-│   ├── package.json
-│   └── vite.config.ts
-│
-├── server/
-│   ├── src/
-│   │   └── index.ts
-│   ├── .env.example
-│   ├── package.json
-│   └── tsconfig.json
-│
-├── screenshots/
-│   ├── join-room.png
-│   └── editor-output.png
-│
-├── .gitignore
-└── README.md
-```
-
----
-
-## 🚀 Local Development
-
-### Prerequisites
-
-- Node.js 22.12+
-- PostgreSQL 14+
-- npm
-
-### 1. Clone
-
-```bash
-git clone https://github.com/sinjaa18/codesync.git
-cd codesync
-```
-
-### 2. Create a Local Database
-
-Create a development role and database using a PostgreSQL administrator account:
-
-```sql
-CREATE ROLE codesync LOGIN PASSWORD 'choose-a-local-password' CREATEDB;
+CREATE ROLE codesync LOGIN PASSWORD 'choose-a-local-password';
 CREATE DATABASE codesync OWNER codesync;
 ```
 
-`CREATEDB` lets Prisma create its temporary shadow database for local migrations. Production deploys should use `npm run db:deploy`, which does not need that permission.
-
-### 3. Start the Backend
-
-```bash
-cd server
-cp .env.example .env
-npm install
-npm run db:migrate -- --name init
-npm run dev
-```
-
-On PowerShell:
+Apply the checked-in Prisma migrations, then start the backend and frontend in separate terminals:
 
 ```powershell
-Copy-Item .env.example .env
+npm --prefix server run db:deploy
+npm --prefix server run dev
 ```
-
-### 4. Start the Frontend
-
-Open another terminal:
-
-```bash
-cd client
-npm install
-cp .env.example .env
-npm run dev
-```
-
-On PowerShell:
 
 ```powershell
-Copy-Item .env.example .env
+npm --prefix client run dev
 ```
 
-Open:
+Open http://localhost:5173. The server listens on port 5000 by default. Register an account, create or enter a room, and invite another registered username or request access to a room. A room ID alone does not grant access.
+
+### Environment variables
+
+The example files contain local-development defaults and placeholders. Copy them to ignored .env files; never commit real credentials.
+
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| PORT | Server | HTTP and WebSocket listen port; defaults to 5000. |
+| DATABASE_URL | Server and Prisma | PostgreSQL connection string. |
+| CLIENT_ORIGIN | Server | Comma-separated allowed browser origins; defaults to http://localhost:5173. |
+| JUDGE0_API_URL | Server | Judge0-compatible API base URL; defaults to the CE endpoint in the server code. |
+| JUDGE0_AUTH_TOKEN | Server | Optional upstream authentication token, depending on the Judge0 provider. |
+| VITE_API_URL | Client build | Public HTTP API base URL; defaults to http://localhost:5000. |
+| VITE_WS_URL | Client build | Public WebSocket URL; defaults to the WebSocket form of the API URL. |
+
+Vite embeds VITE_* values in browser assets. They must contain public URLs only, never secrets.
+
+## Database and migrations
+
+The Prisma schema defines users, sessions, projects, project memberships, files, rooms, room memberships, join requests, chat messages, and persisted Yjs updates. For a development or deployed database, apply checked-in migrations with:
+
+```bash
+npm --prefix server run db:deploy
+```
+
+The db:migrate script runs Prisma’s development migration workflow and is intended for local schema development. Production deployments should use db:deploy against the deployment database.
+
+## Development and quality commands
+
+These root commands are defined in package.json:
+
+```bash
+npm run typecheck
+npm run build
+npm run lint
+npm run test:unit
+npm run test:integration
+npm test
+```
+
+- typecheck checks server source and server tests.
+- build builds the server and client.
+- lint runs ESLint on the client.
+- test:unit runs server unit tests; PostgreSQL is not required.
+- test:integration resets the dedicated test database and runs the PostgreSQL/WebSocket integration test.
+- test runs the server test script, including generated Prisma client, test database reset, test typecheck, unit tests, and integration tests.
+
+### Test database safety
+
+Integration tests use server/.env.test.local. Copy the example with <code>Copy-Item server/.env.test.local.example server/.env.test.local</code>, then replace the placeholder password. Create a separate local database named exactly codesync_test with your PostgreSQL administrator (for example, <code>CREATE DATABASE codesync_test OWNER postgres;</code>), then set DATABASE_URL to that database, for example:
 
 ```text
-http://localhost:5173
+postgresql://postgres:local-password@localhost:5432/codesync_test?schema=public
 ```
 
-Create an account in the application. The first signed-in user to open a room ID owns that room. Owners can invite a registered username from the editor toolbar, or another user can request access by entering the room ID and choosing Request Access. A room ID identifies a room but does not grant access by itself.
+The reset script refuses non-PostgreSQL URLs, hosts outside loopback, and database names other than codesync_test. The integration command resets that database before running. Never point it at a development or production database. The integration test uses a local Judge0 mock; it does not call the public execution service.
 
----
+The integration test exercises HTTP and WebSocket behavior with real PostgreSQL persistence, including authentication, project/file access, room membership, concurrent Yjs edits, presence, chat, join requests, room deletion and reuse, project deletion, and execution request handling. Unit tests cover focused helpers such as execution response validation, join-request reconciliation, observability, benchmark safety, and room lifecycle races.
 
-## ⚙️ Environment Variables
+CI runs these checks on pushes and pull requests to main: server and client dependency installation, migrations against a PostgreSQL 16 service, server tests, typechecks, production builds, and client lint. The scripts do not provide a browser end-to-end suite; the integration test uses WebSocket clients and HTTP requests. Screenshots are illustrative and do not represent a recorded automated browser test.
 
-### Client
+## Deployment
 
-`client/.env.example`
+The repository’s existing project documentation identifies a Vercel-hosted frontend and a Render-hosted backend. The frontend is a Vite static build; the backend is one Node.js process hosting both Express and WebSockets. The backend connects to PostgreSQL through DATABASE_URL and calls the configured Judge0 service for execution.
 
-```env
-VITE_API_URL=http://localhost:5000
-VITE_WS_URL=ws://localhost:5000
+There are no Vercel, Render, or database-provider deployment manifests in this repository. Hosting settings are configured outside the source tree. For a deployment, build the client with public VITE_API_URL and VITE_WS_URL values, configure CLIENT_ORIGIN and server-side secrets on the backend, apply pending migrations with npm --prefix server run db:deploy, then start the compiled server with npm --prefix server start. Confirm that the platform routes WebSocket upgrades to the backend and provides persistent PostgreSQL. Do not expose DATABASE_URL or Judge0 credentials to the client.
+
+## Security and limitations
+
+Implemented protections include:
+
+- Passwords are hashed with scrypt. Server-issued random session tokens expire after one hour; the database stores a SHA-256 token hash rather than the raw token.
+- HTTP routes and WebSocket room joins require a valid session. WebSocket sessions also close on expiry.
+- Room and project authorization is checked server-side. OWNER and EDITOR project roles grant project-room access; VIEWER allows project-file reads but does not itself grant room access. An explicit room membership is checked separately. A room ID is not an access credential.
+- Room chat history and message writes require room access.
+- Inputs are validated with Zod, including execution payload and WebSocket message schemas. Authentication and code execution have per-process rate limits.
+- Code execution is sent to the configured Judge0 service; the CodeSync server does not evaluate source code itself. The request disables sandbox network access and applies server-owned CPU, wall-time, memory, stack, process, and file-size limits. Upstream response size, request time, and returned output are bounded.
+- CORS origins can be configured through CLIENT_ORIGIN; structured logs redact sensitive error details.
+
+Important boundaries:
+
+- The browser keeps the bearer session token in local storage. Treat it as a credential and avoid shared or untrusted devices.
+- Submitted source code and standard input are sent to the configured Judge0 provider. Review that provider’s data-handling terms before using private code.
+- Active sockets, room documents, rate-limit counters, and revocation listeners are process-local. Membership revocation, session revocation, room deletion, and WebSocket broadcasts are coordinated within the current backend process. The deployed design therefore assumes one backend instance; it does not provide cross-instance revocation or collaboration fanout.
+- Yjs updates are stored as an append-only log. Compaction and document history browsing are not implemented.
+- Email verification, password recovery, and multi-factor authentication are not implemented.
+- The repository does not include a LICENSE file. Reuse and contribution terms have not been declared.
+
+## Performance snapshot
+
+A successful local benchmark snapshot is recorded in [docs/performance-baseline.json](docs/performance-baseline.json). It was generated on Windows 11 with Node.js 22.18.0 and PostgreSQL 18.6 on an AMD Ryzen 7 7730U. At the 25-client stage, the benchmark recorded:
+
+| Scenario | Samples | p50 | p95 | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| Authenticated project list | 90 | 26.16 ms | 33.18 ms | 680.53 requests/s |
+| Authenticated project file list | 90 | 28.70 ms | 39.98 ms | 621.02 requests/s |
+| WebSocket room join | 75 | 41.13 ms | 51.33 ms | 267.23 joins/s |
+
+The Yjs client-to-peer update scenario used up to five concurrent clients and recorded p50 9.40 ms and p95 17.25 ms over 180 deliveries, with no failed operations. These are local loopback measurements from one machine, not production capacity or multi-instance scalability claims.
+
+To run the opt-in benchmark against the dedicated local test database:
+
+```bash
+npm --prefix server run benchmark -- --allow-local-target --max-clients 25 --requests 30 --repetitions 3
 ```
 
-Production values:
+The benchmark validates that DATABASE_URL targets loopback PostgreSQL database codesync_test, applies checked-in migrations, creates temporary records, and cleans them up. It does not reset the database or call Judge0. Do not run it against production or a development database.
 
-```env
-VITE_API_URL=https://codesync-7qiq.onrender.com
-VITE_WS_URL=wss://codesync-7qiq.onrender.com
-```
+## Limitations and future improvements
 
-These values are exposed to the browser and should therefore contain only public service URLs.
+1. **Distributed collaboration and revocation:** introduce shared coordination for WebSocket fanout, membership/session revocation, and process-local rate limits before operating more than one backend instance.
+2. **Yjs storage growth:** add safe update compaction and verify recovery against compacted state.
+3. **Security and contribution readiness:** consider an HttpOnly cookie-based session design, a documented content security policy, and an explicit license/contribution guide.
 
-### Server
+## Engineering focus
 
-`server/.env.example`
+CodeSync is built around practical systems concerns: concurrent state reconciliation, authorization at HTTP and WebSocket boundaries, durable recovery from PostgreSQL, safe room teardown, and constrained delegation of untrusted code execution to an external sandbox.
 
-```env
-PORT=5000
-DATABASE_URL=postgresql://codesync:replace-with-local-password@localhost:5432/codesync?schema=public
-CLIENT_ORIGIN=http://localhost:5173
-JUDGE0_API_URL=https://ce.judge0.com
-JUDGE0_AUTH_TOKEN=
-```
+## Maintainer
 
-The Judge0 token is optional and depends on the configured Judge0 provider.
-
-Never commit real secrets.
-`DATABASE_URL` is used by the server and Prisma migrations. Percent-encode reserved characters in the username or password and use a managed PostgreSQL connection string for deployment.
-Apply pending deployment migrations with `npm run db:deploy` before starting the updated backend.
-
----
-
-## 🗄️ Data Model
-
-Prisma manages these PostgreSQL tables:
-
-- `User` and `Session` for accounts and hashed, expiring bearer sessions
-- `Room` and `RoomMembership` for room ownership and access
-- `DocumentUpdate` for the ordered Yjs update log used to restore room documents
-- `Project`, `ProjectMembership`, and `File` for project workspaces and file metadata/content
-
-Foreign keys cascade when an owner or parent record is removed. Indexes cover session expiry, room membership lookups, project membership lookups, and per-room update replay.
-
----
-
-## 📡 API
-
-### Health Check
-
-```http
-GET /health
-GET /ready
-```
-
-`/health` reports that the server process is alive. `/ready` checks PostgreSQL through Prisma and returns `200` when ready or `503` when the database check fails. Neither endpoint exposes configuration or dependency error details. The existing `GET /` informational response remains available.
-
-## 🔎 Operational Diagnostics
-
-The server writes one-line JSON records to standard output with a timestamp, level (`info`, `warn`, or `error`), event name, and only explicitly selected context fields. HTTP responses include `X-Request-ID`; valid UUID v4 values supplied by a caller are reused, and other values are replaced with a server-generated ID. Share that response header when reporting an HTTP problem so the matching `http.request` or error event can be found.
-
-Useful events include HTTP request completion, authentication and authorization rejection, WebSocket lifecycle and protocol failures, execution lifecycle/failure stages, database readiness failures, and unexpected request errors. Successful `/health` and `/ready` probes are omitted from request logs to reduce noise.
-
-Logs intentionally exclude passwords, session tokens, cookies, authorization headers, database URLs, Judge0 credentials, request bodies, source code, and Yjs document/update payloads. WebSocket cursor and presence traffic is not logged individually. These diagnostics are application logs only; CodeSync does not include an external monitoring or tracing service.
-
-Response:
-
-```text
-GET /health  -> 200 { "status": "ok" }
-GET /ready   -> 200 { "status": "ready" }
-```
-
-### Authentication
-
-```http
-POST /auth/signup
-POST /auth/login
-POST /auth/logout
-GET /auth/me
-```
-
-Signup and login accept `{ "username": "...", "password": "..." }`. Usernames are 3–24 letters, numbers, underscores, or hyphens; passwords are 10–128 characters. Successful signup/login returns a bearer token and user profile. Send the token as `Authorization: Bearer <token>` to protected REST endpoints. Logout revokes the session and closes its authenticated WebSocket connections. The browser stores the token in local storage and validates it with `GET /auth/me` after a page refresh.
-
-### Room membership
-
-```http
-POST /rooms/:roomId/access
-POST /rooms/:roomId/invites
-```
-
-The first authenticated user to request access creates the room and becomes its owner. Existing room members can reconnect; only the owner can invite an existing account with `{ "username": "..." }`. The invitation must be sent out of band along with the room ID.
-
-### Project workspaces
-
-```http
-GET    /projects
-POST   /projects                      { "name": "..." }
-POST   /projects/:projectId/invites   { "username": "..." }
-GET    /projects/:projectId/files
-POST   /projects/:projectId/files     { "path": "src/main.ts" }
-PATCH  /projects/:projectId/files/:fileId { "path": "src/app.ts" }
-DELETE /projects/:projectId/files/:fileId
-```
-
-All project endpoints require a bearer session. Project owners invite existing accounts; invited project members can list files, create/rename/delete files, and join their Yjs documents. File paths are relative, limited to safe path segments, and unique within a project. Each file is assigned a separate room, so its live Yjs content and update log are independent from other files. `File.content` is a PostgreSQL snapshot kept in sync with each accepted document update.
-
-### Execute Code
-
-```http
-POST /run
-```
-
-Example request:
-
-```json
-{
-  "language": "javascript",
-  "code": "console.log('Hello CodeSync')"
-}
-```
-
-The server validates the request and submits it to Judge0.
-The endpoint requires a bearer session.
-
----
-
-## 🔌 WebSocket Events
-
-The collaboration protocol uses a small set of events:
-
-```text
-authenticate { token }
-authenticated { user }
-join (includes Yjs state vector)
-joined (includes Yjs update and state vector)
-presence-state { collaborators }
-presence-update { cursor }
-presence-remove { userId }
-doc-update (incremental Yjs update)
-users (participant count)
-user-left
-```
-
-The server returns the update missing from the joining client's state vector. It appends received Yjs updates to PostgreSQL and replays them to rebuild the in-memory document cache when a room is opened. Project file rooms authorize through project membership; the legacy room flow continues to use room membership.
-The authenticated account supplies the user identity; any client-supplied identity field is ignored. The server derives username, stable color, project, and active file from the authenticated socket and its authorized room membership.
-
-### Room chat
-
-The editor's Chat panel is scoped to the active collaboration room. In a project workspace, each file has its own room, so chat history is specific to that file. Messages are stored in PostgreSQL, limited to 2,000 characters, and delivered over the authenticated room WebSocket. The server supplies the author and timestamp. The initial history is limited to the latest 100 messages.
-
-### Join requests and project deletion
-
-Users can request access with a room ID using `POST /rooms/:roomId/requests`. The request remains pending in a separate request table until the project or room owner approves or rejects it; it does not create an active membership. Owners can list requests at `GET /projects/:projectId/requests` or `GET /rooms/:roomId/requests`.
-
-`DELETE /projects/:projectId` is owner-only. It transactionally removes the project's rooms and dependent records before deleting the project, and closes project sockets in the current server process. The dashboard shows the Delete Project action only for owners and asks for confirmation.
-
----
-
-## ⚠️ Current Limitations
-
-CodeSync intentionally keeps the architecture simple.
-
-### Collaboration
-
-Yjs merges concurrent text edits. Updates persist in PostgreSQL as an append-only log; log compaction is not implemented.
-
-### Persistence
-
-PostgreSQL stores accounts, sessions, project and room memberships, file metadata/content snapshots, and collaborative document updates. File document updates remain an append-only log; compaction is not implemented.
-
-### Authentication
-
-Sessions persist in PostgreSQL and expire after one hour; there is no password recovery or email verification yet.
-
-### Scaling
-
-Active WebSocket connections and document caches are process-local. Multiple backend instances need shared broadcasting before realtime collaboration can span them.
-
-### Presence
-
-Presence is ephemeral in-memory WebSocket state and is never written to PostgreSQL. Project collaborators receive usernames, a deterministic user color, and active file paths; cursor coordinates are sent only to collaborators editing that same file. Cursor updates are throttled to at most one every 50 ms per client. A user has one active connection per project; opening the same project in another tab moves that user's presence to the newer connection. Remote text selections are not implemented.
-
-### Execution
-
-Code execution depends on the configured external Judge0 service and its availability and rate limits.
-
----
-
-## 🗺️ Future Improvements
-
-```text
-Current
-  │
-  ├── PostgreSQL accounts, projects, files, memberships, and Yjs updates
-  ├── Per-file conflict-free Yjs synchronization
-  ├── Process-local WebSocket connections
-  └── Single server instance
-        │
-        ▼
-Future
-  │
-  ├── Yjs update compaction and history browsing
-  ├── Redis-based distributed presence
-  ├── Multi-instance WebSocket scaling
-  ├── Distributed rate limiting
-  └── Collaborative project management
-```
-
----
-
-## 💡 What This Project Demonstrates
-
-CodeSync demonstrates practical understanding of:
-
-- WebSocket communication
-- event-driven server architecture
-- CRDT-based realtime state synchronization
-- connection lifecycle management
-- room-based session management
-- Monaco Editor integration
-- REST + WebSocket architecture
-- API validation with Zod
-- external sandboxed code execution
-- frontend/backend deployment
-- production environment configuration
-- debugging and production verification
-
----
-
-## 🎯 Demo Scenario
-
-```text
-1. Create an account and open CodeSync
-        ↓
-2. Enter a new room ID to create a room
-        ↓
-3. Invite a second registered username
-        ↓
-4. Sign in as that user and open the same room
-        ↓
-5. Start typing and watch changes synchronize
-        ↓
-6. Move the cursor
-        ↓
-7. Observe participant presence
-        ↓
-8. Run the code
-        ↓
-9. View execution output
-```
-
----
-
-## 📌 Project Status
-
-**Status: Deployed and functional**
-
-| Component | Platform |
-|---|---|
-| Frontend | Vercel |
-| Backend | Render |
-| Realtime Transport | WebSocket |
-| Code Execution | Judge0 Community Edition |
-
----
-
-## 👨‍💻 Author
-
-**Sintu Kumar**
-
-B.Tech CSE — NIT Agartala
-
-GitHub:  
-https://github.com/sinjaa18
-
----
-
-## 📄 License
-
-This project is a personal learning and portfolio project.
+[Sintu Kumar](https://github.com/sinjaa18)
