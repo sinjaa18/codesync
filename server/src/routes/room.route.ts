@@ -26,15 +26,9 @@ router.post("/:roomId/requests", async (req, res) => {
   const user = await findUserById(res.locals.userId!)
   if (!user) return res.status(404).json({ error: "User not found." })
   const request = await createJoinRequest(roomId.data, user.id)
-  console.log("REQUEST IS:", request)
   if (!request) return res.status(404).json({ error: "Room not found." })
-  try {
-    wsEvents.emit("join-request", request.ownerId, request.type, request.targetId, user.id, user.username)
-  } catch (e) {
-    console.error("WSEVENTS ERROR:", e)
-    throw e
-  }
-  res.status(201).json({ status: "pending" })
+  if (request.created) wsEvents.emit("join-request", request.ownerId, request.type, request.targetId, user.id, user.username)
+  res.status(201).json({ status: "pending", created: request.created })
 })
 
 router.get("/:roomId/requests", async (req, res) => {

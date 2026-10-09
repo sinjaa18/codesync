@@ -65,27 +65,13 @@ export async function hasRoomAccess(roomId: string, userId: string) {
 export async function createJoinRequest(roomId: string, userId: string) {
   const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true, projectId: true } })
   if (!room) return null
-  try {
-    if (room.projectId) {
-      await prisma.projectJoinRequest.upsert({
-        where: { projectId_userId: { projectId: room.projectId, userId } },
-        create: { projectId: room.projectId, userId },
-        update: {},
-      })
-      const project = await prisma.project.findUnique({ where: { id: room.projectId }, select: { ownerId: true } })
-      return { type: "project" as const, targetId: room.projectId, ownerId: project?.ownerId ?? room.ownerId }
-    } else {
-      await prisma.roomJoinRequest.upsert({
-        where: { roomId_userId: { roomId, userId } },
-        create: { roomId, userId },
-        update: {},
-      })
-      return { type: "room" as const, targetId: roomId, ownerId: room.ownerId }
-    }
-  } catch (error) {
-    console.error("createJoinRequest ERROR:", error)
-    return null
+  if (room.projectId) {
+    const inserted = await prisma.projectJoinRequest.createMany({ data: { projectId: room.projectId, userId }, skipDuplicates: true })
+    const project = await prisma.project.findUnique({ where: { id: room.projectId }, select: { ownerId: true } })
+    return { type: "project" as const, targetId: room.projectId, ownerId: project?.ownerId ?? room.ownerId, created: inserted.count > 0 }
   }
+  const inserted = await prisma.roomJoinRequest.createMany({ data: { roomId, userId }, skipDuplicates: true })
+  return { type: "room" as const, targetId: roomId, ownerId: room.ownerId, created: inserted.count > 0 }
 }
 
 export async function getRoomJoinRequests(roomId: string, ownerId: string) {
