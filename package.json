@@ -9,5 +9,8 @@
     "build": "npm --prefix server run build && npm --prefix client run build",
     "lint": "npm --prefix client run lint",
     "typecheck": "npm --prefix server run typecheck && npm --prefix server run test:typecheck"
+  },
+  "dependencies": {
+    "playwright": "^1.64.0"
   }
 }

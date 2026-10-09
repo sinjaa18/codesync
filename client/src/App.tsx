@@ -529,7 +529,9 @@ export default function App() {
 
   const copyRoomId = async () => {
     try {
-      await navigator.clipboard.writeText(roomId)
+      const idToCopy = activeFile?.roomId ?? roomId
+      if (!idToCopy) return
+      await navigator.clipboard.writeText(idToCopy)
       setError("Room ID copied.")
     } catch {
       setError("Could not copy the room ID. Copy it manually.")
@@ -650,7 +652,7 @@ export default function App() {
   return <main className="app">
     <header className="topbar">
       <div className="logo"><span>Code</span><strong>Sync</strong></div>
-      <div className="room-details"><span>{project?.name ?? "Room"}</span><code>{activeFile?.path ?? roomId}</code>{!project && <button className="secondary" onClick={copyRoomId}>Copy ID</button>}</div>
+      <div className="room-details"><span>{project?.name ?? "Room"}</span><code>{activeFile?.path ?? roomId}</code>{activeFile?.roomId && <code>{activeFile.roomId}</code>}{(activeFile?.roomId ?? roomId) && <button className="secondary" onClick={copyRoomId} title="Copy Room ID">Copy ID</button>}</div>
       <div className="toolbar">
         <span className={`connection ${status}`}><i />{status === "connected" ? "Connected" : status === "connecting" ? "Connecting" : "Disconnected"}</span>
         <span className="user-count">{collaborators.length} online</span>
