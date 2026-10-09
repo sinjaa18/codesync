@@ -1,7 +1,7 @@
 import Editor from "@monaco-editor/react"
 import { MonacoBinding } from "y-monaco"
 import type * as Y from "yjs"
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { editor } from "monaco-editor"
 
 type Props = {
@@ -12,26 +12,24 @@ type Props = {
 }
 
 export default function CodeEditor({ doc, language, onCursorMove, remoteCursors }: Props) {
-  const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null)
+  const [editorInstance, setEditorInstance] = useState<editor.IStandaloneCodeEditor | null>(null)
   const decorationsRef = useRef<string[]>([])
 
   const handleMount = (instance: editor.IStandaloneCodeEditor) => {
-    editorRef.current = instance
+    setEditorInstance(instance)
     instance.onDidChangeCursorPosition(({ position }) => onCursorMove(position.lineNumber, position.column))
   }
 
   useEffect(() => {
-    const instance = editorRef.current
-    const model = instance?.getModel()
-    if (!instance || !model) return
-    const binding = new MonacoBinding(doc.getText("code"), model, new Set([instance]))
+    const model = editorInstance?.getModel()
+    if (!editorInstance || !model) return
+    const binding = new MonacoBinding(doc.getText("code"), model, new Set([editorInstance]))
     return () => binding.destroy()
-  }, [doc])
+  }, [doc, editorInstance])
 
   useEffect(() => {
-    const instance = editorRef.current
-    if (!instance) return
-    const model = instance.getModel()
+    if (!editorInstance) return
+    const model = editorInstance.getModel()
     if (!model) return
     const decorations = remoteCursors.map((cursor) => {
       const line = Math.min(Math.max(cursor.line, 1), model.getLineCount())
@@ -46,8 +44,8 @@ export default function CodeEditor({ doc, language, onCursorMove, remoteCursors 
         },
       }
     })
-    decorationsRef.current = instance.deltaDecorations(decorationsRef.current, decorations)
-  }, [remoteCursors])
+    decorationsRef.current = editorInstance.deltaDecorations(decorationsRef.current, decorations)
+  }, [remoteCursors, editorInstance])
 
   return <>
     <style>{remoteCursors.map(({ userId, color }) => {
