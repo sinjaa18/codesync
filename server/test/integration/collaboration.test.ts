@@ -571,6 +571,45 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   peers.push(unrelatedPeer.peer)
   assert.deepEqual(unrelatedPeer.presence.map(({ userId }) => userId), [outsiderAuth.user.id], "presence never crosses project boundaries")
 
+  // --- REGRESSION TESTS: Authorization Revocation ---
+  // Invite guest to privateProject
+  await api(`/projects/${privateProject.id}/invites`, outsiderAuth.token, { username: guestName })
+  const revocationPeer = await connectPeer(new Y.Doc(), privateFile.roomId, guestAuth.token)
+  peers.push(revocationPeer.peer)
+  
+  // 1. Set up listeners before HTTP requests
+  const revokedClosedPromise = new Promise<void>((resolve) => revocationPeer.peer.ws.readyState === WebSocket.CLOSED ? resolve() : revocationPeer.peer.ws.once("close", () => resolve()))
+  
+  // 2. Revoke membership via HTTP (triggers event)
+  const revokeResponse = await api(`/projects/${privateProject.id}/invites/${guestName}`, outsiderAuth.token, undefined, "DELETE")
+  assert.equal(revokeResponse.status, 204, "owner can revoke project membership")
+  
+  // 3. The socket should be forcibly closed by the server
+  let revokedClosed = false
+  try {
+    await Promise.race([
+      revokedClosedPromise.then(() => revokedClosed = true),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Socket was not closed")), 2000))
+    ])
+  } catch (e) {
+    assert.fail("Revoked socket was not forcibly closed by the server")
+  }
+  
+  // 4. Project Deletion
+  const ownerClosedPromise = new Promise<void>((resolve) => unrelatedPeer.peer.ws.readyState === WebSocket.CLOSED ? resolve() : unrelatedPeer.peer.ws.once("close", () => resolve()))
+  const deleteResponse = await api(`/projects/${privateProject.id}`, outsiderAuth.token, undefined, "DELETE")
+  assert.equal(deleteResponse.status, 204, "owner can delete project")
+
+  let ownerClosed = false
+  try {
+    await Promise.race([
+      ownerClosedPromise.then(() => ownerClosed = true),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Socket was not closed on project deletion")), 2000))
+    ])
+  } catch (e) {
+    assert.fail("Socket was not forcibly closed upon project deletion")
+  }
+
   for (const peer of peers) {
     if (peer.ws.readyState === WebSocket.OPEN) peer.ws.close()
   }

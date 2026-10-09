@@ -2,6 +2,17 @@ import * as Y from "yjs"
 import { randomUUID } from "node:crypto"
 import { prisma } from "../db/client.js"
 
+const accessRevocationListeners = new Set<(projectId: string, userId: string) => void>()
+const projectDeletionListeners = new Set<(projectId: string) => void>()
+
+export function onProjectAccessRevoked(listener: (projectId: string, userId: string) => void) {
+  accessRevocationListeners.add(listener)
+}
+
+export function onProjectDeleted(listener: (projectId: string) => void) {
+  projectDeletionListeners.add(listener)
+}
+
 export async function getProjectRole(projectId: string, userId: string) {
   const membership = await prisma.projectMembership.findUnique({
     where: { projectId_userId: { projectId, userId } },
@@ -57,5 +68,26 @@ export async function inviteProjectMember(projectId: string, ownerId: string, me
     create: { projectId, userId: memberId, role: "EDITOR" },
     update: { role: "EDITOR" },
   })
+  return true
+}
+
+export async function revokeProjectMembership(projectId: string, ownerId: string, memberId: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
+  if (project?.ownerId !== ownerId) return false
+  if (ownerId === memberId) return false
+  const { count } = await prisma.projectMembership.deleteMany({
+    where: { projectId, userId: memberId }
+  })
+  if (count) {
+    for (const listener of accessRevocationListeners) listener(projectId, memberId)
+  }
+  return count > 0
+}
+
+export async function deleteProject(projectId: string, ownerId: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
+  if (project?.ownerId !== ownerId) return false
+  await prisma.project.delete({ where: { id: projectId } })
+  for (const listener of projectDeletionListeners) listener(projectId)
   return true
 }

@@ -13,6 +13,7 @@ import type { WSMessage } from "./types/ws.types.js"
 import { getSession, onSessionRevoked } from "./auth/store.js"
 import type { User } from "./auth/store.js"
 import { getRoomPresenceContext, hasRoomAccess, loadRoomDocument, persistRoomUpdate } from "./auth/roomStore.js"
+import { onProjectAccessRevoked, onProjectDeleted } from "./auth/projectStore.js"
 import { prisma } from "./db/client.js"
 import { errorHandler, httpRequestLogger, notFoundHandler, requestContext } from "./observability/http.js"
 import { createReadinessHandler, healthHandler } from "./observability/health.js"
@@ -117,6 +118,22 @@ function leaveRoom(ws: WebSocket) {
 onSessionRevoked((key) => {
   for (const [ws, sessionKey] of socketSessions) {
     if (sessionKey === key) ws.close(1008, "Session revoked")
+  }
+})
+
+onProjectAccessRevoked((projectId, userId) => {
+  for (const [ws, member] of membership) {
+    if (member.projectId === projectId && member.userId === userId) {
+      ws.close(1008, "Project access revoked")
+    }
+  }
+})
+
+onProjectDeleted((projectId) => {
+  for (const [ws, member] of membership) {
+    if (member.projectId === projectId) {
+      ws.close(1008, "Project deleted")
+    }
   }
 })
 

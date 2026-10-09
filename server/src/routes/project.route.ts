@@ -2,7 +2,7 @@ import { Router } from "express"
 import { z } from "zod"
 import { prisma } from "../db/client.js"
 import { findUserByName } from "../auth/store.js"
-import { createProject, createProjectFile, getProjectRole, inviteProjectMember } from "../auth/projectStore.js"
+import { createProject, createProjectFile, getProjectRole, inviteProjectMember, revokeProjectMembership, deleteProject } from "../auth/projectStore.js"
 import { requireAuth } from "../auth/middleware.js"
 import { logWarn } from "../observability/logger.js"
 
@@ -104,6 +104,29 @@ router.post("/:projectId/invites", async (req, res) => {
   if (!await inviteProjectMember(projectId.data, res.locals.userId!, user.id)) {
     logWarn("authorization.project_invite_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
     return res.status(403).json({ error: "Only the project owner can invite participants." })
+  }
+  res.status(204).end()
+})
+
+router.delete("/:projectId/invites/:username", async (req, res) => {
+  const projectId = projectIdSchema.safeParse(req.params.projectId)
+  const username = z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_-]+$/).safeParse(req.params.username)
+  if (!projectId.success || !username.success) return res.status(400).json({ error: "Invalid project ID or username." })
+  const user = await findUserByName(username.data)
+  if (!user) return res.status(404).json({ error: "No account found for that username." })
+  if (!await revokeProjectMembership(projectId.data, res.locals.userId!, user.id)) {
+    logWarn("authorization.project_revoke_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
+    return res.status(403).json({ error: "Only the project owner can remove participants." })
+  }
+  res.status(204).end()
+})
+
+router.delete("/:projectId", async (req, res) => {
+  const projectId = projectIdSchema.safeParse(req.params.projectId)
+  if (!projectId.success) return res.status(400).json({ error: "Invalid project ID." })
+  if (!await deleteProject(projectId.data, res.locals.userId!)) {
+    logWarn("authorization.project_delete_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
+    return res.status(403).json({ error: "Only the project owner can delete the project." })
   }
   res.status(204).end()
 })
