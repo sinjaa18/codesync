@@ -1,6 +1,7 @@
 import * as Y from "yjs"
 import { randomUUID } from "node:crypto"
 import { prisma } from "../db/client.js"
+import { roomLifecycle } from "../collaboration/roomLifecycle.js"
 
 const accessRevocationListeners = new Set<(projectId: string, userId: string) => void>()
 const projectDeletionListeners = new Set<(projectId: string) => void>()
@@ -96,7 +97,14 @@ export async function deleteProject(projectId: string, ownerId: string) {
   if (projectDeletionsInProgress.has(projectId)) return false
   projectDeletionsInProgress.add(projectId)
   for (const listener of projectDeletionListeners) listener(projectId)
+  const deletingRooms: string[] = []
   try {
+    const rooms = await prisma.room.findMany({ where: { projectId }, select: { id: true } })
+    for (const room of rooms) {
+      roomLifecycle.beginDeletion(room.id)
+      deletingRooms.push(room.id)
+    }
+    await Promise.all(deletingRooms.map((roomId) => roomLifecycle.drain(roomId)))
     await prisma.$transaction(async (tx) => {
       // Room.projectId uses SetNull for legacy standalone rooms, so delete every
       // project room explicitly to cascade its Yjs updates and chat history.
@@ -108,6 +116,7 @@ export async function deleteProject(projectId: string, ownerId: string) {
     for (const listener of projectDeletionAbortedListeners) listener(projectId)
     throw error
   } finally {
+    for (const roomId of deletingRooms) roomLifecycle.finishDeletion(roomId)
     projectDeletionsInProgress.delete(projectId)
   }
 }

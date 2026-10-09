@@ -1,6 +1,7 @@
 import { Router } from "express"
 import { z } from "zod"
 import { prisma } from "../db/client.js"
+import { deleteRoom } from "../auth/roomStore.js"
 import { findUserByName, wsEvents } from "../auth/store.js"
 import { createProject, createProjectFile, getProjectRole, inviteProjectMember, revokeProjectMembership, deleteProject, getProjectJoinRequests, approveProjectJoinRequest, rejectProjectJoinRequest } from "../auth/projectStore.js"
 import { requireAuth } from "../auth/middleware.js"
@@ -90,7 +91,7 @@ router.delete("/:projectId/files/:fileId", async (req, res) => {
   }
   const file = await prisma.file.findFirst({ where: { id: fileId.data, projectId: projectId.data }, select: { roomId: true } })
   if (!file) return res.status(404).json({ error: "File not found." })
-  if (file.roomId) await prisma.room.delete({ where: { id: file.roomId } })
+  if (file.roomId) await deleteRoom(file.roomId)
   else await prisma.file.delete({ where: { id: fileId.data } })
   res.status(204).end()
 })

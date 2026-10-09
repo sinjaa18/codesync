@@ -459,7 +459,7 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   }
   assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "../secrets.txt" })).status, 400, "file paths reject traversal")
   assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "src/main.ts" })).status, 409, "duplicate file paths are rejected")
-  const guestProjectPeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
+  let guestProjectPeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
   peers.push(guestProjectPeer.peer)
   assert.equal(guestProjectPeer.peer.doc.getText("code").toString(), "", "a project member can join the file document")
   assert.deepEqual(guestProjectPeer.presence.map(({ userId }) => userId), [guestAuth.user.id], "new collaborators receive the current presence snapshot")
@@ -562,6 +562,36 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const disposableFile = await disposable.json() as { id: string }
   assert.equal((await api(`/projects/${project.id}/files/${disposableFile.id}`, guestAuth.token, undefined, "DELETE")).status, 204, "files can be deleted")
   assert.equal((await api(`/projects/${project.id}/files/${disposableFile.id}`, guestAuth.token, undefined, "DELETE")).status, 404, "deleted files stay unavailable")
+
+  const staleFileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "deleted-state.js" })
+  const staleFile = await staleFileResponse.json() as { id: string; roomId: string }
+  const staleContent = "deleted-room-secret-content"
+  const stalePeerResult = await connectPeer(new Y.Doc(), staleFile.roomId, guestAuth.token)
+  peers.push(stalePeerResult.peer)
+  stalePeerResult.peer.doc.getText("code").insert(0, staleContent)
+  await waitFor(async () => (await prisma.file.findUnique({ where: { id: staleFile.id } }))?.content === staleContent)
+  const stalePeerClosed = new Promise<void>((resolve) => stalePeerResult.peer.ws.readyState === WebSocket.CLOSED ? resolve() : stalePeerResult.peer.ws.once("close", () => resolve()))
+  const deleteStaleFile = await api(`/projects/${project.id}/files/${staleFile.id}`, ownerToken, undefined, "DELETE")
+  assert.equal(deleteStaleFile.status, 204, "owner can delete a file with a live room socket")
+  await stalePeerClosed
+  assert.equal(await prisma.room.count({ where: { id: staleFile.roomId } }), 0, "file deletion removes the old room row")
+
+  assert.equal((await api(`/rooms/${staleFile.roomId}/messages`, outsiderAuth.token)).status, 404, "deleted room data is inaccessible before ID reuse")
+  assert.equal((await api(`/rooms/${staleFile.roomId}/access`, outsiderAuth.token, {})).status, 201, "a deleted room ID can be reused as a fresh standalone room")
+  const reusedPeer = await connectPeer(new Y.Doc(), staleFile.roomId, outsiderAuth.token)
+  peers.push(reusedPeer.peer)
+  assert.equal(reusedPeer.peer.doc.getText("code").toString(), "console.log('Hello from CodeSync')", "reused room starts from a fresh document without deleted content")
+  const freshContent = "new-room-only-content"
+  const reusedText = reusedPeer.peer.doc.getText("code")
+  reusedText.delete(0, reusedText.length)
+  reusedText.insert(0, freshContent)
+  await waitFor(async () => (await prisma.documentUpdate.count({ where: { roomId: staleFile.roomId } })) > 1)
+  const reusedReconnect = await connectPeer(new Y.Doc(), staleFile.roomId, outsiderAuth.token)
+  peers.push(reusedReconnect.peer)
+  assert.equal(reusedReconnect.peer.doc.getText("code").toString(), freshContent, "only the new room's persisted content is returned after reconnect")
+  assert.doesNotMatch(reusedReconnect.peer.doc.getText("code").toString(), /deleted-room-secret-content/)
+  guestProjectPeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
+  peers.push(guestProjectPeer.peer)
 
   const removeOutsider = nextMessage(guestProjectPeer.peer.ws, "presence-remove")
   const outsiderClosed = new Promise<void>((resolve) => outsiderProjectPeer.peer.ws.once("close", () => resolve()))

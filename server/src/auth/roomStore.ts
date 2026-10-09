@@ -1,5 +1,6 @@
 import * as Y from "yjs"
 import { prisma } from "../db/client.js"
+import { roomLifecycle } from "../collaboration/roomLifecycle.js"
 
 function createInitialUpdate() {
   const doc = new Y.Doc()
@@ -10,16 +11,21 @@ function createInitialUpdate() {
 }
 
 export async function ensureRoomAccess(roomId: string, userId: string) {
+  if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
   const existing = await prisma.room.findUnique({
     where: { id: roomId },
     include: { memberships: { where: { userId }, select: { userId: true } } },
   })
   if (existing) {
+    if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
     const projectMember = existing.projectId
       ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: existing.projectId, userId } }, select: { userId: true } })
       : null
+    if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
     return { created: false, allowed: existing.memberships.length > 0 || Boolean(projectMember) }
   }
+
+  if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
 
   try {
     await prisma.room.create({
@@ -30,11 +36,14 @@ export async function ensureRoomAccess(roomId: string, userId: string) {
         updates: { create: { update: createInitialUpdate() } },
       },
     })
+    if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
     return { created: true, allowed: true }
   } catch (error) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") {
+      if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
       const room = await prisma.room.findUnique({ where: { id: roomId }, include: { memberships: { where: { userId } } } })
       const projectMember = room?.projectId ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }) : null
+      if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
       return { created: false, allowed: Boolean(room?.memberships.length || projectMember) }
     }
     throw error
@@ -54,17 +63,22 @@ export async function inviteRoomMember(roomId: string, ownerId: string, memberId
 }
 
 export async function hasRoomAccess(roomId: string, userId: string) {
+  if (roomLifecycle.isDeleting(roomId)) return false
   const membership = await prisma.roomMembership.findUnique({ where: { roomId_userId: { roomId, userId } }, select: { userId: true } })
+  if (roomLifecycle.isDeleting(roomId)) return false
   if (membership) return true
   const room = await prisma.room.findUnique({ where: { id: roomId }, select: { projectId: true } })
+  if (roomLifecycle.isDeleting(roomId)) return false
   if (!room?.projectId) return false
   const projectMember = await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { role: true } })
+  if (roomLifecycle.isDeleting(roomId)) return false
   return projectMember?.role === "OWNER" || projectMember?.role === "EDITOR"
 }
 
 export async function createJoinRequest(roomId: string, userId: string) {
+  if (roomLifecycle.isDeleting(roomId)) return null
   const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true, projectId: true } })
-  if (!room) return null
+  if (!room || roomLifecycle.isDeleting(roomId)) return null
   if (room.projectId) {
     const inserted = await prisma.projectJoinRequest.createMany({ data: { projectId: room.projectId, userId }, skipDuplicates: true })
     const project = await prisma.project.findUnique({ where: { id: room.projectId }, select: { ownerId: true } })
@@ -132,6 +146,16 @@ export async function loadRoomDocument(roomId: string) {
   const doc = new Y.Doc()
   for (const entry of updates) Y.applyUpdate(doc, new Uint8Array(entry.update))
   return doc
+}
+
+export async function deleteRoom(roomId: string) {
+  roomLifecycle.beginDeletion(roomId)
+  try {
+    await roomLifecycle.drain(roomId)
+    await prisma.room.delete({ where: { id: roomId } })
+  } finally {
+    roomLifecycle.finishDeletion(roomId)
+  }
 }
 
 export async function persistRoomUpdate(roomId: string, update: Uint8Array, content: string) {

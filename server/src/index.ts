@@ -18,6 +18,7 @@ import { prisma } from "./db/client.js"
 import { errorHandler, httpRequestLogger, notFoundHandler, requestContext } from "./observability/http.js"
 import { createReadinessHandler, healthHandler } from "./observability/health.js"
 import { isDatabaseError, logError, logInfo, logWarn, safeCloseReason, safeErrorFields } from "./observability/logger.js"
+import { roomLifecycle, RoomLifecycleError, type RoomEpoch } from "./collaboration/roomLifecycle.js"
 
 const app = express()
 const port = Number(process.env.PORT) || 5000
@@ -26,14 +27,14 @@ const wss = new WebSocketServer({ server, maxPayload: 1_000_000 })
 const rooms = new Map<string, Set<WebSocket>>()
 type PresenceCursor = { line: number; column: number } | null
 type Presence = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: PresenceCursor; online: true }
-type Membership = { roomId: string; userId: string; scopeKey: string; projectId: string | null; fileId: string | null }
+type Membership = { roomId: string; userId: string; scopeKey: string; projectId: string | null; fileId: string | null; roomEpoch: RoomEpoch }
 const membership = new Map<WebSocket, Membership>()
 const presenceScopes = new Map<string, Map<string, { ws: WebSocket; presence: Presence }>>()
 const socketSessions = new Map<WebSocket, string>()
 const socketUsers = new Map<WebSocket, User>()
 const socketExpiryTimers = new Map<WebSocket, NodeJS.Timeout>()
-const roomDocs = new Map<string, Y.Doc>()
-const roomDocLoads = new Map<string, Promise<Y.Doc>>()
+const roomDocs = new Map<string, { epoch: RoomEpoch; doc: Y.Doc }>()
+const roomDocLoads = new Map<string, { epoch: RoomEpoch; promise: Promise<Y.Doc> }>()
 const roomPersistenceQueues = new Map<string, Promise<void>>()
 const deletingProjects = new Set<string>()
 const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()) ?? ["http://localhost:5173"]
@@ -54,22 +55,27 @@ function colorForUser(userId: string) {
   return presenceColors[hash % presenceColors.length]!
 }
 
-function getRoomDoc(roomId: string) {
+function getRoomDoc(roomId: string, epoch: RoomEpoch) {
+  if (!roomLifecycle.isCurrent(roomId, epoch)) return Promise.reject(new RoomLifecycleError())
   const existing = roomDocs.get(roomId)
-  if (existing) return Promise.resolve(existing)
+  if (existing?.epoch === epoch) return Promise.resolve(existing.doc)
   let loading = roomDocLoads.get(roomId)
-  if (!loading) {
-    loading = loadRoomDocument(roomId)
-    roomDocLoads.set(roomId, loading)
-  }
-  return loading.then((doc) => {
-    roomDocs.set(roomId, doc)
-    if (roomDocLoads.get(roomId) === loading) roomDocLoads.delete(roomId)
+  if (loading?.epoch === epoch) return loading.promise
+  let promise: Promise<Y.Doc>
+  promise = roomLifecycle.load(roomId, epoch, () => loadRoomDocument(roomId), (doc) => doc.destroy()).then((doc) => {
+    if (!roomLifecycle.isCurrent(roomId, epoch) || roomDocLoads.get(roomId)?.promise !== promise) {
+      doc.destroy()
+      throw new RoomLifecycleError()
+    }
+    roomDocs.set(roomId, { epoch, doc })
+    if (roomDocLoads.get(roomId)?.promise === promise) roomDocLoads.delete(roomId)
     return doc
   }).catch((error) => {
-    if (roomDocLoads.get(roomId) === loading) roomDocLoads.delete(roomId)
+    if (roomDocLoads.get(roomId)?.promise === promise) roomDocLoads.delete(roomId)
     throw error
   })
+  roomDocLoads.set(roomId, { epoch, promise })
+  return promise
 }
 
 function decodeBase64(value: string) {
@@ -109,13 +115,30 @@ function leaveRoom(ws: WebSocket) {
   }
   if (!room?.size) {
     rooms.delete(member.roomId)
-    roomDocs.get(member.roomId)?.destroy()
-    roomDocs.delete(member.roomId)
+    const cached = roomDocs.get(member.roomId)
+    if (cached?.epoch === member.roomEpoch) {
+      cached.doc.destroy()
+      roomDocs.delete(member.roomId)
+    }
   } else {
     broadcast(member.roomId, { type: "user-left", userId: member.userId })
     broadcast(member.roomId, { type: "users", count: room.size })
   }
+  roomLifecycle.release(member.roomId, member.roomEpoch)
 }
+
+roomLifecycle.onDeleting((roomId) => {
+  for (const [ws, member] of membership) {
+    if (member.roomId === roomId) {
+      ws.close(1008, "Room deleted")
+      leaveRoom(ws)
+    }
+  }
+  roomDocs.get(roomId)?.doc.destroy()
+  roomDocs.delete(roomId)
+  roomDocLoads.delete(roomId)
+  roomPersistenceQueues.delete(roomId)
+})
 
 onSessionRevoked((key) => {
   for (const [ws, sessionKey] of socketSessions) {
@@ -249,70 +272,87 @@ wss.on("connection", (ws, request) => {
 
       const roomId = message.roomId.trim()
       const userId = authenticatedUser.id
-      stage = "room_authorization"
-      if (!userId || !await hasRoomAccess(roomId, userId)) {
-        logWarn("websocket.room_access_denied", { connectionId, userId, roomId })
-        send(ws, { type: "error", message: "You are not authorized to join this room." })
+      const roomEpoch = roomLifecycle.capture(roomId)
+      if (!roomEpoch) {
+        send(ws, { type: "error", message: "The collaboration room is being deleted." })
+        ws.close(1008, "Room deleted")
         return
       }
-      stage = "room_lookup"
-      const context = await getRoomPresenceContext(roomId)
-      if (!context) {
-        logWarn("websocket.room_access_denied", { connectionId, userId, roomId, reason: "room_not_found" })
-        send(ws, { type: "error", message: "The collaboration room no longer exists." })
-        return
+      let joinedRoom = false
+      try {
+        stage = "room_authorization"
+        if (!userId || !await hasRoomAccess(roomId, userId) || !roomLifecycle.isCurrent(roomId, roomEpoch)) {
+          logWarn("websocket.room_access_denied", { connectionId, userId, roomId })
+          send(ws, { type: "error", message: "You are not authorized to join this room." })
+          return
+        }
+        stage = "room_lookup"
+        const context = await getRoomPresenceContext(roomId)
+        if (!context || !roomLifecycle.isCurrent(roomId, roomEpoch)) {
+          logWarn("websocket.room_access_denied", { connectionId, userId, roomId, reason: "room_not_found" })
+          send(ws, { type: "error", message: "The collaboration room no longer exists." })
+          return
+        }
+        if (context.projectId && deletingProjects.has(context.projectId)) {
+          send(ws, { type: "error", message: "This project is being deleted." })
+          return
+        }
+        const scopeKey = context.projectId ? `project:${context.projectId}` : `room:${roomId}`
+        const scope = presenceScopes.get(scopeKey)
+        const previousUserSocket = scope?.get(userId)?.ws
+        if (previousUserSocket && previousUserSocket !== ws) {
+          leaveRoom(previousUserSocket)
+          previousUserSocket.close(1000, "Presence moved to another connection")
+        }
+        leaveRoom(ws)
+        stage = "document_load"
+        const doc = await getRoomDoc(roomId, roomEpoch)
+        if (!roomLifecycle.isCurrent(roomId, roomEpoch) || (context.projectId && deletingProjects.has(context.projectId))) {
+          send(ws, { type: "error", message: "The collaboration room is being deleted." })
+          ws.close(1008, "Room deleted")
+          return
+        }
+        const room = rooms.get(roomId) ?? new Set<WebSocket>()
+        room.add(ws)
+        rooms.set(roomId, room)
+        roomDocs.set(roomId, { epoch: roomEpoch, doc })
+        membership.set(ws, { roomId, userId, scopeKey, projectId: context.projectId, fileId: context.fileId, roomEpoch })
+        joinedRoom = true
+        activeRoomId = roomId
+        activeProjectId = context.projectId
+        activeFileId = context.fileId
+        const collaborator: Presence = {
+          userId,
+          username: authenticatedUser.username,
+          color: colorForUser(userId),
+          projectId: context.projectId,
+          fileId: context.fileId,
+          filePath: context.filePath,
+          cursor: null,
+          online: true,
+        }
+        const nextScope = presenceScopes.get(scopeKey) ?? new Map<string, { ws: WebSocket; presence: Presence }>()
+        nextScope.set(userId, { ws, presence: collaborator })
+        presenceScopes.set(scopeKey, nextScope)
+        send(ws, {
+          type: "joined",
+          roomId,
+          update: Buffer.from(clientStateVector ? Y.encodeStateAsUpdate(doc, clientStateVector) : Y.encodeStateAsUpdate(doc)).toString("base64"),
+          stateVector: Buffer.from(Y.encodeStateVector(doc)).toString("base64"),
+          count: room.size,
+        })
+        send(ws, {
+          type: "presence-state",
+          collaborators: [...nextScope.values()].map((entry) => entry.presence.fileId === context.fileId
+            ? entry.presence
+            : { ...entry.presence, cursor: null }),
+        })
+        broadcastPresence(scopeKey, { type: "presence-update", collaborator }, ws)
+        broadcast(roomId, { type: "users", count: room.size }, ws)
+        logInfo("websocket.room_joined", { connectionId, userId, projectId: context.projectId, roomId, fileId: context.fileId })
+      } finally {
+        if (!joinedRoom) roomLifecycle.release(roomId, roomEpoch)
       }
-      if (context.projectId && deletingProjects.has(context.projectId)) {
-        send(ws, { type: "error", message: "This project is being deleted." })
-        return
-      }
-      const scopeKey = context.projectId ? `project:${context.projectId}` : `room:${roomId}`
-      const scope = presenceScopes.get(scopeKey)
-      const previousUserSocket = scope?.get(userId)?.ws
-      if (previousUserSocket && previousUserSocket !== ws) {
-        leaveRoom(previousUserSocket)
-        previousUserSocket.close(1000, "Presence moved to another connection")
-      }
-      leaveRoom(ws)
-      stage = "document_load"
-      const doc = await getRoomDoc(roomId)
-      const room = rooms.get(roomId) ?? new Set<WebSocket>()
-      room.add(ws)
-      rooms.set(roomId, room)
-      roomDocs.set(roomId, doc)
-      membership.set(ws, { roomId, userId, scopeKey, projectId: context.projectId, fileId: context.fileId })
-      activeRoomId = roomId
-      activeProjectId = context.projectId
-      activeFileId = context.fileId
-      const collaborator: Presence = {
-        userId,
-        username: authenticatedUser.username,
-        color: colorForUser(userId),
-        projectId: context.projectId,
-        fileId: context.fileId,
-        filePath: context.filePath,
-        cursor: null,
-        online: true,
-      }
-      const nextScope = presenceScopes.get(scopeKey) ?? new Map<string, { ws: WebSocket; presence: Presence }>()
-      nextScope.set(userId, { ws, presence: collaborator })
-      presenceScopes.set(scopeKey, nextScope)
-      send(ws, {
-        type: "joined",
-        roomId,
-        update: Buffer.from(clientStateVector ? Y.encodeStateAsUpdate(doc, clientStateVector) : Y.encodeStateAsUpdate(doc)).toString("base64"),
-        stateVector: Buffer.from(Y.encodeStateVector(doc)).toString("base64"),
-        count: room.size,
-      })
-      send(ws, {
-        type: "presence-state",
-        collaborators: [...nextScope.values()].map((entry) => entry.presence.fileId === context.fileId
-          ? entry.presence
-          : { ...entry.presence, cursor: null }),
-      })
-      broadcastPresence(scopeKey, { type: "presence-update", collaborator }, ws)
-      broadcast(roomId, { type: "users", count: room.size }, ws)
-      logInfo("websocket.room_joined", { connectionId, userId, projectId: context.projectId, roomId, fileId: context.fileId })
       return
     }
 
@@ -326,19 +366,28 @@ wss.on("connection", (ws, request) => {
       ws.close(1008, "Project deleted")
       return
     }
+    if (!roomLifecycle.isCurrent(member.roomId, member.roomEpoch)) {
+      ws.close(1008, "Room deleted")
+      return
+    }
     if (message.type === "doc-update" && message.roomId !== member.roomId) {
       logWarn("websocket.protocol_rejected", { connectionId, userId: member.userId, roomId: member.roomId, reason: "room_mismatch" })
       return
     }
     if (message.type === "doc-update") {
-      const doc = roomDocs.get(member.roomId)
-      if (!doc) return
+      const cached = roomDocs.get(member.roomId)
+      if (!cached || cached.epoch !== member.roomEpoch) return
+      const doc = cached.doc
       try {
         const update = decodeBase64(message.update)
         Y.applyUpdate(doc, update)
         const content = doc.getText("code").toString()
         const previous = roomPersistenceQueues.get(member.roomId) ?? Promise.resolve()
-        const persisted = previous.catch(() => undefined).then(() => persistRoomUpdate(member.roomId, update, content))
+        const persisted = previous.catch(() => undefined).then(() => {
+          const release = roomLifecycle.acquireOperation(member.roomId, member.roomEpoch)
+          if (!release) throw new RoomLifecycleError()
+          return persistRoomUpdate(member.roomId, update, content).finally(release)
+        })
         roomPersistenceQueues.set(member.roomId, persisted)
         try {
           await persisted
@@ -346,12 +395,14 @@ wss.on("connection", (ws, request) => {
           if (roomPersistenceQueues.get(member.roomId) === persisted) roomPersistenceQueues.delete(member.roomId)
         }
       } catch (error) {
+        if (error instanceof RoomLifecycleError) return
         logError(isDatabaseError(error) ? "database.websocket_operation_failed" : "websocket.document_update_failed", {
           connectionId, userId: member.userId, projectId: member.projectId, roomId: member.roomId, fileId: member.fileId, operation: "persist_document_update", ...safeErrorFields(error),
         })
         send(ws, { type: "error", message: "The document update could not be applied or saved." })
         return
       }
+      if (!roomLifecycle.isCurrent(member.roomId, member.roomEpoch)) return
       broadcast(member.roomId, { ...message, userId: member.userId }, ws)
     } else if (message.type === "presence-update") {
       const entry = presenceScopes.get(member.scopeKey)?.get(member.userId)
@@ -366,7 +417,15 @@ wss.on("connection", (ws, request) => {
         broadcastPresence(member.scopeKey, { type: "presence-update", collaborator }, ws)
       }
     } else if (message.type === "chat-send") {
-      const saved = await saveRoomChatMessage(member.roomId, member.userId, message.clientMessageId, message.content)
+      const release = roomLifecycle.acquireOperation(member.roomId, member.roomEpoch)
+      if (!release) return
+      let saved: Awaited<ReturnType<typeof saveRoomChatMessage>>
+      try {
+        saved = await saveRoomChatMessage(member.roomId, member.userId, message.clientMessageId, message.content)
+      } finally {
+        release()
+      }
+      if (!roomLifecycle.isCurrent(member.roomId, member.roomEpoch)) return
       broadcast(member.roomId, {
         type: "chat-message",
         chatMessage: {
