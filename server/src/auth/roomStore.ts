@@ -19,10 +19,11 @@ export async function ensureRoomAccess(roomId: string, userId: string) {
   if (existing) {
     if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
     const projectMember = existing.projectId
-      ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: existing.projectId, userId } }, select: { userId: true } })
+      ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: existing.projectId, userId } }, select: { role: true } })
       : null
     if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
-    return { created: false, allowed: existing.memberships.length > 0 || Boolean(projectMember) }
+    const projectRoleCanJoinRoom = projectMember?.role === "OWNER" || projectMember?.role === "EDITOR"
+    return { created: false, allowed: existing.memberships.length > 0 || projectRoleCanJoinRoom }
   }
 
   if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
@@ -42,9 +43,10 @@ export async function ensureRoomAccess(roomId: string, userId: string) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") {
       if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
       const room = await prisma.room.findUnique({ where: { id: roomId }, include: { memberships: { where: { userId } } } })
-      const projectMember = room?.projectId ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }) : null
+      const projectMember = room?.projectId ? await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { role: true } }) : null
       if (roomLifecycle.isDeleting(roomId)) return { created: false, allowed: false }
-      return { created: false, allowed: Boolean(room?.memberships.length || projectMember) }
+      const projectRoleCanJoinRoom = projectMember?.role === "OWNER" || projectMember?.role === "EDITOR"
+      return { created: false, allowed: Boolean(room?.memberships.length || projectRoleCanJoinRoom) }
     }
     throw error
   }
