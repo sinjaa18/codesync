@@ -19,9 +19,17 @@ CodeSync is a browser-based collaborative code workspace. It brings project file
 
 ## Screenshots
 
-![Room join screen](screenshots/join-room.png)
+### Editor and code execution
 
-![Collaborative editor](screenshots/editor-output.png)
+![CodeSync editor with the project explorer, collaborator panel, Monaco editor, and execution output](screenshots/editor.png)
+
+### Live collaboration
+
+![Two CodeSync sessions editing the same room](screenshots/collaboration.png)
+
+### Room chat and collaborators
+
+![Room chat alongside the collaborators panel](screenshots/chat-collaborators.png)
 
 ## Technology choices
 
