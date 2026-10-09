@@ -135,6 +135,7 @@ router.delete("/:projectId/requests/:username", async (req, res) => {
   if (!user) return res.status(404).json({ error: "User not found." })
   const success = await rejectProjectJoinRequest(projectId.data, res.locals.userId!, user.id)
   if (!success) return res.status(403).json({ error: "Could not reject request." })
+  wsEvents.emit("request-rejected", user.id, projectId.data)
   res.status(204).end()
 })
 

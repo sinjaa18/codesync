@@ -4,13 +4,19 @@ import { prisma } from "../db/client.js"
 
 const accessRevocationListeners = new Set<(projectId: string, userId: string) => void>()
 const projectDeletionListeners = new Set<(projectId: string) => void>()
+const projectDeletionAbortedListeners = new Set<(projectId: string) => void>()
+const projectDeletionsInProgress = new Set<string>()
 
 export function onProjectAccessRevoked(listener: (projectId: string, userId: string) => void) {
   accessRevocationListeners.add(listener)
 }
 
-export function onProjectDeleted(listener: (projectId: string) => void) {
+export function onProjectDeleting(listener: (projectId: string) => void) {
   projectDeletionListeners.add(listener)
+}
+
+export function onProjectDeletionAborted(listener: (projectId: string) => void) {
+  projectDeletionAbortedListeners.add(listener)
 }
 
 export async function getProjectRole(projectId: string, userId: string) {
@@ -87,23 +93,33 @@ export async function revokeProjectMembership(projectId: string, ownerId: string
 export async function deleteProject(projectId: string, ownerId: string) {
   const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
   if (project?.ownerId !== ownerId) return false
-  await prisma.project.delete({ where: { id: projectId } })
+  if (projectDeletionsInProgress.has(projectId)) return false
+  projectDeletionsInProgress.add(projectId)
   for (const listener of projectDeletionListeners) listener(projectId)
-  return true
+  try {
+    await prisma.$transaction(async (tx) => {
+      // Room.projectId uses SetNull for legacy standalone rooms, so delete every
+      // project room explicitly to cascade its Yjs updates and chat history.
+      await tx.room.deleteMany({ where: { projectId } })
+      await tx.project.delete({ where: { id: projectId } })
+    })
+    return true
+  } catch (error) {
+    for (const listener of projectDeletionAbortedListeners) listener(projectId)
+    throw error
+  } finally {
+    projectDeletionsInProgress.delete(projectId)
+  }
 }
 
 export async function getProjectJoinRequests(projectId: string, ownerId: string) {
   const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
-  if (project?.ownerId !== ownerId) {
-    console.log("getProjectJoinRequests MISMATCH", { projectOwnerId: project?.ownerId, ownerId })
-    return []
-  }
+  if (project?.ownerId !== ownerId) return []
   const requests = await prisma.projectJoinRequest.findMany({
     where: { projectId },
     include: { user: { select: { id: true, username: true } } },
     orderBy: { createdAt: "asc" }
   })
-  console.log("getProjectJoinRequests RETURNING", requests.length)
   return requests
 }
 

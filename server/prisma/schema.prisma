@@ -32,6 +32,7 @@ model User {
   roomMemberships    RoomMembership[]
   projectJoinRequests ProjectJoinRequest[]
   roomJoinRequests   RoomJoinRequest[]
+  chatMessages       ChatMessage[]
 }
 
 model Session {
@@ -94,10 +95,25 @@ model Room {
   memberships RoomMembership[]
   joinRequests RoomJoinRequest[]
   updates     DocumentUpdate[]
+  chatMessages ChatMessage[]
   file        File?
 
   @@index([ownerId, updatedAt])
   @@index([projectId])
+}
+
+model ChatMessage {
+  id              String   @id @default(cuid())
+  roomId          String
+  authorId        String
+  clientMessageId String?
+  content         String   @db.VarChar(2000)
+  createdAt       DateTime @default(now())
+  room            Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  author          User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, authorId, clientMessageId])
+  @@index([roomId, createdAt, id])
 }
 
 model RoomMembership {

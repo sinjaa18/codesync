@@ -42,6 +42,9 @@ Open the application in two browser tabs, join the same room, and start editing.
 | ⚡ Real-time editing | Code changes are synchronized through WebSockets |
 | 🎯 Cursor sharing | Remote cursor positions are synchronized between participants |
 | 👥 Presence | Shows collaborator usernames, stable colors, active files, and remote cursors |
+| 💬 Room chat | Expandable per-room chat with PostgreSQL history and authenticated realtime delivery |
+| 🧩 Collapsible collaborators | Expand or collapse the online collaborators and pending request panel |
+| 🗑️ Owner project deletion | Confirmed owner-only deletion removes project files, rooms, updates, requests, and chat history |
 | 🧑‍💻 Monaco Editor | Full editor experience with syntax highlighting |
 | 🌐 Multi-language | JavaScript, TypeScript, Python, C++, and Java |
 | ▶️ Code execution | Execute code through Judge0 Community Edition |
@@ -264,7 +267,7 @@ Current protections include:
 
 ### Storage limitation
 
-Accounts, sessions, room membership, project metadata, file records, and Yjs updates are stored in PostgreSQL. Active WebSocket connections and document caches remain process-local, so realtime broadcasts still require a single backend instance.
+Accounts, sessions, room membership, project metadata, file records, chat messages, pending join requests, and Yjs updates are stored in PostgreSQL. Active WebSocket connections, revocation event listeners, and document caches remain process-local. Revocation and project-deletion events reach all applicable sockets in this single-process architecture, but events do not cross backend processes; realtime broadcasts and prompt revocation therefore require a single backend instance.
 
 The current authentication system does not include email verification, password reset, or multi-factor authentication.
 
@@ -324,7 +327,7 @@ To remove the test database when finished, connect as a PostgreSQL administrator
 DROP DATABASE codesync_test;
 ```
 
-The integration suite covers signup/login/session revocation, project membership and file authorization, lifecycle and isolation, three-client WebSocket presence, cursors, concurrent Yjs updates, late join and reconnect state, execution validation/failures/rate limits/result isolation, and PostgreSQL-backed restart recovery. It records a small local Yjs synchronization latency sample as diagnostic output; it is not a scalability benchmark.
+The integration suite covers signup/login/session revocation, project membership and file authorization, lifecycle and isolation, three-client WebSocket presence, cursors, concurrent Yjs updates, late join and reconnect state, persistent authorized chat, join-request approval/rejection/idempotency, project deletion cleanup and socket closure, execution validation/failures/rate limits/result isolation, and PostgreSQL-backed restart recovery. It records a small local Yjs synchronization latency sample as diagnostic output; it is not a scalability benchmark.
 
 The execution unit tests use injected Judge0 responses and cover resource settings, output normalization/truncation, the submission and polling deadline, status mapping, and malformed or oversized responses. Integration tests exercise the authenticated API with the local mock.
 
@@ -534,7 +537,7 @@ Open:
 http://localhost:5173
 ```
 
-Create an account in the application. The first signed-in user to open a room ID owns that room. To collaborate, the owner invites another registered username from the editor toolbar; the invited user can then sign in and enter the room ID.
+Create an account in the application. The first signed-in user to open a room ID owns that room. Owners can invite a registered username from the editor toolbar, or another user can request access by entering the room ID and choosing Request Access. A room ID identifies a room but does not grant access by itself.
 
 ---
 
@@ -626,7 +629,7 @@ POST /auth/logout
 GET /auth/me
 ```
 
-Signup and login accept `{ "username": "...", "password": "..." }`. Usernames are 3–24 letters, numbers, underscores, or hyphens; passwords are 10–128 characters. Successful signup/login returns a bearer token and user profile. Send the token as `Authorization: Bearer <token>` to protected REST endpoints. Logout revokes the session and closes its authenticated WebSocket connections. The browser keeps the token in memory, so users sign in again after a page refresh.
+Signup and login accept `{ "username": "...", "password": "..." }`. Usernames are 3–24 letters, numbers, underscores, or hyphens; passwords are 10–128 characters. Successful signup/login returns a bearer token and user profile. Send the token as `Authorization: Bearer <token>` to protected REST endpoints. Logout revokes the session and closes its authenticated WebSocket connections. The browser stores the token in local storage and validates it with `GET /auth/me` after a page refresh.
 
 ### Room membership
 
@@ -690,6 +693,16 @@ user-left
 
 The server returns the update missing from the joining client's state vector. It appends received Yjs updates to PostgreSQL and replays them to rebuild the in-memory document cache when a room is opened. Project file rooms authorize through project membership; the legacy room flow continues to use room membership.
 The authenticated account supplies the user identity; any client-supplied identity field is ignored. The server derives username, stable color, project, and active file from the authenticated socket and its authorized room membership.
+
+### Room chat
+
+The editor's Chat panel is scoped to the active collaboration room. In a project workspace, each file has its own room, so chat history is specific to that file. Messages are stored in PostgreSQL, limited to 2,000 characters, and delivered over the authenticated room WebSocket. The server supplies the author and timestamp. The initial history is limited to the latest 100 messages.
+
+### Join requests and project deletion
+
+Users can request access with a room ID using `POST /rooms/:roomId/requests`. The request remains pending in a separate request table until the project or room owner approves or rejects it; it does not create an active membership. Owners can list requests at `GET /projects/:projectId/requests` or `GET /rooms/:roomId/requests`.
+
+`DELETE /projects/:projectId` is owner-only. It transactionally removes the project's rooms and dependent records before deleting the project, and closes project sockets in the current server process. The dashboard shows the Delete Project action only for owners and asks for confirmation.
 
 ---
 

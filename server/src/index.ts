@@ -12,8 +12,8 @@ import projectRoutes from "./routes/project.route.js"
 import type { WSMessage } from "./types/ws.types.js"
 import { getSession, onSessionRevoked } from "./auth/store.js"
 import type { User } from "./auth/store.js"
-import { getRoomPresenceContext, hasRoomAccess, loadRoomDocument, persistRoomUpdate } from "./auth/roomStore.js"
-import { onProjectAccessRevoked, onProjectDeleted } from "./auth/projectStore.js"
+import { getRoomPresenceContext, hasRoomAccess, loadRoomDocument, persistRoomUpdate, saveRoomChatMessage } from "./auth/roomStore.js"
+import { onProjectAccessRevoked, onProjectDeleting, onProjectDeletionAborted } from "./auth/projectStore.js"
 import { prisma } from "./db/client.js"
 import { errorHandler, httpRequestLogger, notFoundHandler, requestContext } from "./observability/http.js"
 import { createReadinessHandler, healthHandler } from "./observability/health.js"
@@ -35,6 +35,7 @@ const socketExpiryTimers = new Map<WebSocket, NodeJS.Timeout>()
 const roomDocs = new Map<string, Y.Doc>()
 const roomDocLoads = new Map<string, Promise<Y.Doc>>()
 const roomPersistenceQueues = new Map<string, Promise<void>>()
+const deletingProjects = new Set<string>()
 const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()) ?? ["http://localhost:5173"]
 
 const messageSchema = z.discriminatedUnion("type", [
@@ -42,6 +43,7 @@ const messageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("join"), roomId: z.string().trim().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/), stateVector: z.string().max(20_000).optional() }),
   z.object({ type: z.literal("doc-update"), roomId: z.string().min(1).max(64), update: z.string().min(4).max(750_000) }),
   z.object({ type: z.literal("presence-update"), cursor: z.object({ line: z.number().int().min(1), column: z.number().int().min(1) }).strict().nullable(), userId: z.string().optional() }).strict(),
+  z.object({ type: z.literal("chat-send"), clientMessageId: z.string().uuid(), content: z.string().trim().min(1).max(2000) }).strict(),
 ])
 
 const presenceColors = ["#f28b82", "#fbbc04", "#34a853", "#8ab4f8", "#c58af9", "#ff8bcb", "#78d9ec", "#f6bf76"]
@@ -129,12 +131,17 @@ onProjectAccessRevoked((projectId, userId) => {
   }
 })
 
-onProjectDeleted((projectId) => {
+onProjectDeleting((projectId) => {
+  deletingProjects.add(projectId)
   for (const [ws, member] of membership) {
     if (member.projectId === projectId) {
       ws.close(1008, "Project deleted")
     }
   }
+})
+
+onProjectDeletionAborted((projectId) => {
+  deletingProjects.delete(projectId)
 })
 
 import { wsEvents } from "./auth/store.js"
@@ -152,6 +159,12 @@ wsEvents.on("request-approved", (userId: string, targetId: string) => {
     if (user.id === userId) {
       ws.send(JSON.stringify({ type: "request-approved", targetId }))
     }
+  }
+})
+
+wsEvents.on("request-rejected", (userId: string, targetId: string) => {
+  for (const [ws, user] of socketUsers.entries()) {
+    if (user.id === userId) send(ws, { type: "request-rejected", targetId })
   }
 })
 
@@ -249,6 +262,10 @@ wss.on("connection", (ws, request) => {
         send(ws, { type: "error", message: "The collaboration room no longer exists." })
         return
       }
+      if (context.projectId && deletingProjects.has(context.projectId)) {
+        send(ws, { type: "error", message: "This project is being deleted." })
+        return
+      }
       const scopeKey = context.projectId ? `project:${context.projectId}` : `room:${roomId}`
       const scope = presenceScopes.get(scopeKey)
       const previousUserSocket = scope?.get(userId)?.ws
@@ -302,6 +319,11 @@ wss.on("connection", (ws, request) => {
     const member = membership.get(ws)
     if (!member) {
       if (message.type !== "presence-update") logWarn("websocket.protocol_rejected", { connectionId, userId: authenticatedUser.id, reason: "room_not_joined" })
+      if (message.type === "chat-send") send(ws, { type: "error", message: "Join an authorized room before sending chat messages." })
+      return
+    }
+    if (member.projectId && deletingProjects.has(member.projectId)) {
+      ws.close(1008, "Project deleted")
       return
     }
     if (message.type === "doc-update" && message.roomId !== member.roomId) {
@@ -343,6 +365,19 @@ wss.on("connection", (ws, request) => {
       } else {
         broadcastPresence(member.scopeKey, { type: "presence-update", collaborator }, ws)
       }
+    } else if (message.type === "chat-send") {
+      const saved = await saveRoomChatMessage(member.roomId, member.userId, message.clientMessageId, message.content)
+      broadcast(member.roomId, {
+        type: "chat-message",
+        chatMessage: {
+          id: saved.id,
+          clientMessageId: saved.clientMessageId,
+          roomId: saved.roomId,
+          content: saved.content,
+          createdAt: saved.createdAt,
+          author: saved.author,
+        },
+      })
     }
     } catch (error) {
       logError(isDatabaseError(error) ? "database.websocket_operation_failed" : "websocket.message_failed", {

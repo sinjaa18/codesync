@@ -15,7 +15,8 @@ const prisma = new PrismaClient()
 const encode = (value: Uint8Array) => Buffer.from(value).toString("base64")
 const decode = (value: string) => new Uint8Array(Buffer.from(value, "base64"))
 type Presence = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: { line: number; column: number } | null; online: boolean }
-type Message = { type: string; message?: string; update?: string; stateVector?: string; count?: number; userId?: string; collaborator?: Presence; collaborators?: Presence[]; cursor?: { line: number; column: number } | null }
+type ChatMessage = { id: string; roomId: string; content: string; createdAt: string; author: { id: string; username: string } }
+type Message = { type: string; message?: string; update?: string; stateVector?: string; count?: number; userId?: string; targetId?: string; collaborator?: Presence; collaborators?: Presence[]; cursor?: { line: number; column: number } | null; chatMessage?: ChatMessage }
 
 function readMessage(raw: WebSocket.RawData): Message | null {
   try {
@@ -600,28 +601,41 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   // --- REGRESSION TESTS: Join Requests ---
   const requestName = `${prefix}req`
   const requestAuth = await signup(requestName)
+
+  assert.equal((await api(`/rooms/${privateFile.roomId}/messages`, requestAuth.token)).status, 404, "unauthorized users cannot read room chat history")
+  await assertSocketRoomDenied(requestAuth.token, privateFile.roomId)
+  const liveJoinRequest = nextMessage(unrelatedPeer.peer.ws, "join-request", 3_000, (message) => message.userId === requestAuth.user.id)
   
   // 1. Request access
   const requestAccessRes = await api(`/rooms/${privateFile.roomId}/requests`, requestAuth.token, {}, "POST")
-  if (requestAccessRes.status !== 201) console.error(await requestAccessRes.text())
-  try {
-    assert.equal(requestAccessRes.status, 201, "can request access to a room")
-  } catch (e) {
-    console.log(serverLogs.join(""))
-    throw e
-  }
+  assert.equal(requestAccessRes.status, 201, "can request access to a room")
+  assert.equal((await liveJoinRequest).targetId, privateProject.id, "online owner receives a persisted join request notification")
+  const repeatedRequest = await api(`/rooms/${privateFile.roomId}/requests`, requestAuth.token, {}, "POST")
+  assert.equal(repeatedRequest.status, 201)
+  assert.equal((await repeatedRequest.json() as { created: boolean }).created, false, "repeated submissions do not create duplicate requests")
+  const ownerSocketClosed = new Promise<void>((resolve) => unrelatedPeer.peer.ws.once("close", () => resolve()))
+  unrelatedPeer.peer.ws.close()
+  await ownerSocketClosed
+  const offlineRequestAuth = await signup(`${prefix}offreq`)
+  assert.equal((await api(`/rooms/${privateFile.roomId}/requests`, offlineRequestAuth.token, {}, "POST")).status, 201, "requests can be submitted while the owner is offline")
+  const reconnectedOwner = await connectPeer(new Y.Doc(), privateFile.roomId, outsiderAuth.token)
+  peers.push(reconnectedOwner.peer)
+  const recoveredRequests = await api(`/projects/${privateProject.id}/requests`, outsiderAuth.token)
+  assert.equal((await recoveredRequests.json() as unknown[]).length, 2, "owner can retrieve pending requests after reconnecting")
 
   // 2. Owner lists requests
   const listRequestsRes = await api(`/projects/${privateProject.id}/requests`, outsiderAuth.token)
   assert.equal(listRequestsRes.status, 200, "owner can list requests")
-  const requests = await listRequestsRes.json() as any[]
-  if (requests.length !== 1) console.error("REQUESTS ARE:", requests)
-  assert.equal(requests.length, 1, "join request is listed")
-  assert.equal(requests[0].user.username, requestName, "requester username matches")
+  const requests = await listRequestsRes.json() as Array<{ user: { username: string } }>
+  assert.equal(requests.length, 2, "pending requests are listed without duplicates")
+  assert.ok(requests.some((request) => request.user.username === requestName), "requester username matches")
+  assert.equal((await api(`/projects/${privateProject.id}/requests/${requestName}/approve`, requestAuth.token, {}, "POST")).status, 403, "only the owner can approve requests")
 
   // 3. Reject access
   const rejectRes = await api(`/projects/${privateProject.id}/requests/${requestName}`, outsiderAuth.token, undefined, "DELETE")
   assert.equal(rejectRes.status, 204, "owner can reject request")
+  assert.equal((await api(`/projects/${privateProject.id}/files`, requestAuth.token)).status, 404, "rejection does not grant project access")
+  await assertSocketRoomDenied(requestAuth.token, privateFile.roomId)
   
 
   // 4. Request again and approve
@@ -633,11 +647,55 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const approvedPeer = await connectPeer(new Y.Doc(), privateFile.roomId, requestAuth.token)
   peers.push(approvedPeer.peer)
   assert.equal(approvedPeer.peer.ws.readyState, WebSocket.OPEN, "approved user can connect to the room")
+  const ownerChat = nextMessage(reconnectedOwner.peer.ws, "chat-message", 3_000, (message) => message.chatMessage?.content === "persistent room chat")
+  const guestChat = nextMessage(approvedPeer.peer.ws, "chat-message", 3_000, (message) => message.chatMessage?.content === "persistent room chat")
+  const chatClientId = randomUUID()
+  approvedPeer.peer.ws.send(JSON.stringify({ type: "chat-send", clientMessageId: chatClientId, content: "persistent room chat" }))
+  const [ownerChatMessage, guestChatMessage] = await Promise.all([ownerChat, guestChat])
+  assert.equal(ownerChatMessage.chatMessage?.author.username, requestName, "chat author comes from the authenticated account")
+  assert.equal(guestChatMessage.chatMessage?.id, ownerChatMessage.chatMessage?.id, "authorized room members receive the same persisted message")
+  const duplicateDelivery = nextMessage(reconnectedOwner.peer.ws, "chat-message", 3_000, (message) => message.chatMessage?.id === ownerChatMessage.chatMessage?.id)
+  approvedPeer.peer.ws.send(JSON.stringify({ type: "chat-send", clientMessageId: chatClientId, content: "persistent room chat" }))
+  assert.equal((await duplicateDelivery).chatMessage?.id, ownerChatMessage.chatMessage?.id, "duplicate submission is idempotent")
+  assert.equal(await prisma.chatMessage.count({ where: { roomId: privateFile.roomId, authorId: requestAuth.user.id } }), 1, "duplicate submissions create one stored message")
+  const invalidChat = nextMessage(approvedPeer.peer.ws, "error")
+  approvedPeer.peer.ws.send(JSON.stringify({ type: "chat-send", clientMessageId: randomUUID(), content: "   " }))
+  assert.match((await invalidChat).message ?? "", /Invalid message/)
+  const chatHistory = await api(`/rooms/${privateFile.roomId}/messages`, requestAuth.token)
+  assert.equal(chatHistory.status, 200)
+  assert.ok((await chatHistory.json() as ChatMessage[]).some((message) => message.id === guestChatMessage.chatMessage?.id), "chat history is persisted and available after reconnect")
+  assert.equal((await api(`/projects/${privateProject.id}`, requestAuth.token, undefined, "DELETE")).status, 403, "non-owners cannot delete a project")
+
+  const rollbackProjectResponse = await api("/projects", outsiderAuth.token, { name: `${prefix}rollback` })
+  const rollbackProject = await rollbackProjectResponse.json() as { id: string }
+  const rollbackFileResponse = await api(`/projects/${rollbackProject.id}/files`, outsiderAuth.token, { path: "rollback.js" })
+  const rollbackFile = await rollbackFileResponse.json() as { id: string; roomId: string }
+  const rollbackPeer = await connectPeer(new Y.Doc(), rollbackFile.roomId, outsiderAuth.token)
+  peers.push(rollbackPeer.peer)
+  await prisma.$executeRawUnsafe(`CREATE FUNCTION "codesync_fail_project_delete"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated delete failure'; END; $$`)
+  await prisma.$executeRawUnsafe(`CREATE TRIGGER "codesync_fail_project_delete" BEFORE DELETE ON "Project" FOR EACH ROW EXECUTE FUNCTION "codesync_fail_project_delete"()`)
+  const rollbackSocketClosed = new Promise<void>((resolve) => rollbackPeer.peer.ws.once("close", () => resolve()))
+  assert.equal((await api(`/projects/${rollbackProject.id}`, outsiderAuth.token, undefined, "DELETE")).status, 500, "database failure is reported safely")
+  await rollbackSocketClosed
+  await prisma.$executeRawUnsafe(`DROP TRIGGER "codesync_fail_project_delete" ON "Project"`)
+  await prisma.$executeRawUnsafe(`DROP FUNCTION "codesync_fail_project_delete"()`)
+  assert.equal(await prisma.project.count({ where: { id: rollbackProject.id } }), 1, "failed deletion rolls back the project")
+  assert.equal(await prisma.file.count({ where: { id: rollbackFile.id } }), 1, "failed deletion rolls back its files")
+  assert.equal(await prisma.room.count({ where: { id: rollbackFile.roomId } }), 1, "failed deletion rolls back its rooms")
+  const rollbackReconnect = await connectPeer(new Y.Doc(), rollbackFile.roomId, outsiderAuth.token)
+  peers.push(rollbackReconnect.peer)
+  assert.equal(rollbackReconnect.peer.ws.readyState, WebSocket.OPEN, "access is restored after a failed deletion")
 
   // 6. Project Deletion
-  const ownerClosedPromise = new Promise<void>((resolve) => unrelatedPeer.peer.ws.readyState === WebSocket.CLOSED ? resolve() : unrelatedPeer.peer.ws.once("close", () => resolve()))
+  const ownerClosedPromise = new Promise<void>((resolve) => reconnectedOwner.peer.ws.readyState === WebSocket.CLOSED ? resolve() : reconnectedOwner.peer.ws.once("close", () => resolve()))
+  const collaboratorClosedPromise = new Promise<void>((resolve) => approvedPeer.peer.ws.readyState === WebSocket.CLOSED ? resolve() : approvedPeer.peer.ws.once("close", () => resolve()))
   const deleteResponse = await api(`/projects/${privateProject.id}`, outsiderAuth.token, undefined, "DELETE")
   assert.equal(deleteResponse.status, 204, "owner can delete project")
+  await collaboratorClosedPromise
+  assert.equal(await prisma.project.count({ where: { id: privateProject.id } }), 0, "project is removed")
+  assert.equal(await prisma.room.count({ where: { id: privateFile.roomId } }), 0, "project rooms are explicitly deleted despite SetNull relation")
+  assert.equal(await prisma.chatMessage.count({ where: { roomId: privateFile.roomId } }), 0, "project chat history is removed with its room")
+  assert.equal(await prisma.room.count({ where: { id: sharedRoom } }), 1, "unrelated rooms are unaffected")
 
   let ownerClosed = false
   try {

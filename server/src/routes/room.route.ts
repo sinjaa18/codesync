@@ -1,7 +1,7 @@
 import { Router } from "express"
 import { z } from "zod"
 import { requireAuth } from "../auth/middleware.js"
-import { inviteRoomMember, ensureRoomAccess, createJoinRequest, getRoomJoinRequests, approveRoomJoinRequest, rejectRoomJoinRequest } from "../auth/roomStore.js"
+import { inviteRoomMember, ensureRoomAccess, createJoinRequest, getRoomJoinRequests, approveRoomJoinRequest, rejectRoomJoinRequest, hasRoomAccess, listRoomChatMessages } from "../auth/roomStore.js"
 import { findUserByName, findUserById, wsEvents } from "../auth/store.js"
 import { logWarn } from "../observability/logger.js"
 
@@ -31,6 +31,13 @@ router.post("/:roomId/requests", async (req, res) => {
   res.status(201).json({ status: "pending", created: request.created })
 })
 
+router.get("/:roomId/messages", async (req, res) => {
+  const roomId = roomIdSchema.safeParse(req.params.roomId)
+  if (!roomId.success) return res.status(400).json({ error: "Invalid room ID." })
+  if (!await hasRoomAccess(roomId.data, res.locals.userId!)) return res.status(404).json({ error: "Room not found." })
+  res.json(await listRoomChatMessages(roomId.data, 100))
+})
+
 router.get("/:roomId/requests", async (req, res) => {
   const roomId = roomIdSchema.safeParse(req.params.roomId)
   if (!roomId.success) return res.status(400).json({ error: "Invalid room ID." })
@@ -58,6 +65,7 @@ router.delete("/:roomId/requests/:username", async (req, res) => {
   if (!user) return res.status(404).json({ error: "User not found." })
   const success = await rejectRoomJoinRequest(roomId.data, res.locals.userId!, user.id)
   if (!success) return res.status(403).json({ error: "Could not reject request." })
+  wsEvents.emit("request-rejected", user.id, roomId.data)
   res.status(204).end()
 })
 

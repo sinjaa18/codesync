@@ -20,8 +20,15 @@ export type PresenceUpdateMessage={
   cursor:{ line:number; column:number } | null
 }
 
+export type ChatSendMessage={
+  type:"chat-send"
+  clientMessageId:string
+  content:string
+}
+
 export type WSMessage=
 | AuthenticateMessage
 | JoinMessage
 | DocumentUpdateMessage
 | PresenceUpdateMessage
+| ChatSendMessage

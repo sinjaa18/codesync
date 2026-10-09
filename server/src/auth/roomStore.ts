@@ -130,3 +130,21 @@ export async function persistRoomUpdate(roomId: string, update: Uint8Array, cont
     prisma.file.updateMany({ where: { roomId }, data: { content } }),
   ])
 }
+
+export async function listRoomChatMessages(roomId: string, limit = 100) {
+  return prisma.chatMessage.findMany({
+    where: { roomId },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: limit,
+    include: { author: { select: { id: true, username: true } } },
+  }).then((messages) => messages.reverse())
+}
+
+export async function saveRoomChatMessage(roomId: string, authorId: string, clientMessageId: string, content: string) {
+  return prisma.chatMessage.upsert({
+    where: { roomId_authorId_clientMessageId: { roomId, authorId, clientMessageId } },
+    create: { roomId, authorId, clientMessageId, content },
+    update: {},
+    include: { author: { select: { id: true, username: true } } },
+  })
+}

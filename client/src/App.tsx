@@ -18,15 +18,17 @@ type ServerMessage = {
   collaborator?: Collaborator
   collaborators?: Collaborator[]
   user?: { id: string; username: string }
-  targetId?: string
   targetType?: string
+  targetId?: string
   username?: string
+  chatMessage?: ChatMessage
 }
 type AuthResponse = { token: string; user: { id: string; username: string }; error?: string }
 type Collaborator = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: { line: number; column: number } | null; online: boolean }
 type Project = { id: string; name: string; role: string }
 type WorkspaceFile = { id: string; projectId: string; path: string; content: string; roomId: string | null }
 type JoinRequest = { user: { id: string; username: string }; targetType: "project" | "room"; targetId: string }
+type ChatMessage = { id: string; clientMessageId: string | null; roomId: string; content: string; createdAt: string; author: { id: string; username: string } }
 
 function encodeBase64(bytes: Uint8Array) {
   let binary = ""
@@ -68,6 +70,13 @@ export default function App() {
   const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([])
   const [canRequestAccess, setCanRequestAccess] = useState(false)
   const [requestStatus, setRequestStatus] = useState<"idle" | "pending">("idle")
+  const [collaboratorsExpanded, setCollaboratorsExpanded] = useState(true)
+  const [chatExpanded, setChatExpanded] = useState(false)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatDraft, setChatDraft] = useState("")
+  const [chatLoading, setChatLoading] = useState(false)
+  const [chatError, setChatError] = useState("")
+  const [deletingProject, setDeletingProject] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const docRef = useRef(doc)
   const activeRoomRef = useRef<string | null>(null)
@@ -75,6 +84,7 @@ export default function App() {
   const lastCursorSentAtRef = useRef(0)
   const pendingCursorRef = useRef<{ line: number; column: number } | null>(null)
   const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const chatLoadIdRef = useRef(0)
 
   useEffect(() => {
     const storedToken = localStorage.getItem("token")
@@ -291,6 +301,7 @@ export default function App() {
       setError("Enter a room ID between 1 and 64 characters.")
       return
     }
+    const chatLoadId = ++chatLoadIdRef.current
     const previousSocket = wsRef.current
     wsRef.current = null
     activeRoomRef.current = null
@@ -301,6 +312,9 @@ export default function App() {
     lastCursorSentAtRef.current = 0
     lastCursorRef.current = ""
     setCollaborators([])
+    setChatMessages([])
+    setChatDraft("")
+    setChatError("")
     setError("")
     setStatus("connecting")
     setCanRequestAccess(false)
@@ -366,6 +380,25 @@ export default function App() {
         setRoomId(normalizedRoom)
         setStatus("connected")
         setJoined(true)
+        setChatLoading(true)
+        fetch(`${apiUrl}/rooms/${encodeURIComponent(normalizedRoom)}/messages`, { headers: { Authorization: `Bearer ${token}` } })
+          .then(async (response) => {
+            const data: unknown = await response.json()
+            if (!response.ok || !Array.isArray(data)) throw new Error("Could not load chat history.")
+            if (chatLoadId === chatLoadIdRef.current && activeRoomRef.current === normalizedRoom) {
+              setChatMessages((current) => {
+                const combined = new Map((data as ChatMessage[]).map((message) => [message.id, message]))
+                current.forEach((message) => combined.set(message.id, message))
+                return [...combined.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)).slice(-200)
+              })
+            }
+          })
+          .catch((err: unknown) => {
+            if (chatLoadId === chatLoadIdRef.current) setChatError(err instanceof Error ? err.message : "Could not load chat history.")
+          })
+          .finally(() => {
+            if (chatLoadId === chatLoadIdRef.current) setChatLoading(false)
+          })
         lastCursorRef.current = ""
         fetch(`${apiUrl}/rooms/${encodeURIComponent(normalizedRoom)}/requests`, { headers: { Authorization: `Bearer ${token}` } })
           .then((res) => res.ok ? res.json() : [])
@@ -383,7 +416,15 @@ export default function App() {
       if (data.type === "request-approved" && data.targetId) {
         if (!joined && roomId === data.targetId) {
            connect(data.targetId)
+        } else if (!joined) {
+          setRequestStatus("idle")
+          setCanRequestAccess(false)
+          setError("Your request was approved. Join the room again to continue.")
         }
+      }
+      if (data.type === "request-rejected" && !joined) {
+        setRequestStatus("idle")
+        setError("Your request to join was declined.")
       }
       if (data.type === "presence-state" && Array.isArray(data.collaborators)) setCollaborators(data.collaborators)
       if (data.type === "presence-update" && data.collaborator) {
@@ -395,6 +436,11 @@ export default function App() {
         })
       }
       if (data.type === "presence-remove" && data.userId) setCollaborators((current) => current.filter((collaborator) => collaborator.userId !== data.userId))
+      if (data.type === "chat-message" && data.chatMessage && data.chatMessage.roomId === activeRoomRef.current) {
+        setChatMessages((current) => current.some((message) => message.id === data.chatMessage!.id)
+          ? current
+          : [...current, data.chatMessage!].slice(-200))
+      }
       if (data.type === "code-update") {
         setError("The server is using an outdated collaboration protocol. Refresh the application.")
         ws.close()
@@ -445,6 +491,7 @@ export default function App() {
   }
 
   const leaveRoom = () => {
+    chatLoadIdRef.current += 1
     wsRef.current?.close()
     wsRef.current = null
     activeRoomRef.current = null
@@ -457,6 +504,7 @@ export default function App() {
     cursorTimerRef.current = null
     pendingCursorRef.current = null
     setCollaborators([])
+    setChatMessages([])
     setOutput("")
     setActiveFile(null)
     setError("")
@@ -538,21 +586,57 @@ export default function App() {
     }
   }
 
+  const sendChatMessage = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const content = chatDraft.trim()
+    const ws = wsRef.current
+    if (!content || content.length > 2000 || ws?.readyState !== WebSocket.OPEN || status !== "connected") return
+    ws.send(JSON.stringify({ type: "chat-send", clientMessageId: crypto.randomUUID(), content }))
+    setChatDraft("")
+    setChatError("")
+  }
+
+  const deleteProjectFromWorkspace = async () => {
+    if (!project || project.role !== "OWNER" || deletingProject) return
+    if (!window.confirm(`Delete project “${project.name}” and all of its files and room data? This cannot be undone.`)) return
+    setDeletingProject(true)
+    setError("")
+    try {
+      const response = await fetch(`${apiUrl}/projects/${encodeURIComponent(project.id)}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await response.json().catch(() => ({})) as { error?: string }
+      if (!response.ok) throw new Error(data.error || "Could not delete project.")
+      leaveRoom()
+      setProjects((items) => items.filter((item) => item.id !== project.id))
+      setProject(null)
+      setFiles([])
+      setJoinRequests([])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete project.")
+    } finally {
+      setDeletingProject(false)
+    }
+  }
+
   const approveRequest = async (req: JoinRequest) => {
     try {
-      await fetch(`${apiUrl}/${req.targetType}s/${encodeURIComponent(req.targetId)}/requests/${encodeURIComponent(req.user.username)}/approve`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
+      const response = await fetch(`${apiUrl}/${req.targetType}s/${encodeURIComponent(req.targetId)}/requests/${encodeURIComponent(req.user.username)}/approve`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
+      if (!response.ok) throw new Error("Could not approve this request.")
       setJoinRequests(prev => prev.filter(r => r.user.id !== req.user.id))
-    } catch (error) {
-      console.error(error)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not approve this request.")
     }
   }
 
   const rejectRequest = async (req: JoinRequest) => {
     try {
-      await fetch(`${apiUrl}/${req.targetType}s/${encodeURIComponent(req.targetId)}/requests/${encodeURIComponent(req.user.username)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } })
+      const response = await fetch(`${apiUrl}/${req.targetType}s/${encodeURIComponent(req.targetId)}/requests/${encodeURIComponent(req.user.username)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } })
+      if (!response.ok) throw new Error("Could not reject this request.")
       setJoinRequests(prev => prev.filter(r => r.user.id !== req.user.id))
-    } catch (error) {
-      console.error(error)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reject this request.")
     }
   }
 
@@ -631,6 +715,7 @@ export default function App() {
             {!files.length && <li className="tagline">This project has no files.</li>}
           </ul>
           {activeFile && <button className="open-workspace" onClick={() => openFile(activeFile)}>Open {activeFile.path}</button>}
+          {project.role === "OWNER" && <div className="project-danger-zone"><strong>Project settings</strong><p>Deleting this project permanently removes its files and collaboration history.</p><button className="danger" disabled={deletingProject} onClick={deleteProjectFromWorkspace}>{deletingProject ? "Deleting…" : "Delete project"}</button></div>}
           {joinRequests.length > 0 && <div className="join-requests" style={{ marginTop: 24, padding: 16, backgroundColor: "var(--surface)", borderRadius: 8 }}>
             <h3 style={{ margin: "0 0 12px", fontSize: 14 }}>Pending Join Requests</h3>
             <ul style={{ padding: 0, margin: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
@@ -652,10 +737,11 @@ export default function App() {
   return <main className="app">
     <header className="topbar">
       <div className="logo"><span>Code</span><strong>Sync</strong></div>
-      <div className="room-details"><span>{project?.name ?? "Room"}</span><code>{activeFile?.path ?? roomId}</code>{activeFile?.roomId && <code>{activeFile.roomId}</code>}{(activeFile?.roomId ?? roomId) && <button className="secondary" onClick={copyRoomId} title="Copy Room ID">Copy ID</button>}</div>
+      <div className="room-details"><span>{project?.name ?? "Room"}</span><code>{activeFile?.path ?? roomId}</code>{(activeFile?.roomId ?? roomId) && <><span className="room-id-label">Room ID</span><code>{activeFile?.roomId ?? roomId}</code><button className="secondary" onClick={copyRoomId} title="Copy Room ID">Copy ID</button></>}</div>
       <div className="toolbar">
         <span className={`connection ${status}`}><i />{status === "connected" ? "Connected" : status === "connecting" ? "Connecting" : "Disconnected"}</span>
         <span className="user-count">{collaborators.length} online</span>
+        <button className="secondary" aria-expanded={chatExpanded} aria-controls="room-chat" onClick={() => setChatExpanded((expanded) => !expanded)}>{chatExpanded ? "Hide chat" : "Chat"}</button>
         <input aria-label="Invite username" placeholder="Invite username" value={inviteUsername} onChange={(event) => setInviteUsername(event.target.value)} />
         <button className="secondary" disabled={!inviteUsername.trim()} onClick={inviteMember}>Invite</button>
         <select aria-label="Language" value={language} onChange={(event) => setLanguage(event.target.value)}>
@@ -672,7 +758,8 @@ export default function App() {
       {project && <aside className="file-explorer"><div className="explorer-heading"><span>EXPLORER</span><button title="New file" aria-label="New file" onClick={createFile}>+</button></div><div className="explorer-project">{project.name}</div>
         {files.map((file) => <div className={`explorer-file${activeFile?.id === file.id ? " selected" : ""}`} key={file.id} style={{ paddingLeft: `${8 + Math.max(0, file.path.split("/").length - 1) * 12}px` }}><button title={file.path} onClick={() => openFile(file)}>{file.path.split("/").at(-1)}</button><span><button aria-label={`Rename ${file.path}`} title="Rename" onClick={() => renameFile(file)}>✎</button><button aria-label={`Delete ${file.path}`} title="Delete" onClick={() => deleteFile(file)}>×</button></span></div>)}
       </aside>}
-      <aside className="collaborator-panel"><div className="collaborator-heading">Collaborators <span>{collaborators.length}</span></div>
+      <aside className={`collaborator-panel${collaboratorsExpanded ? "" : " collapsed"}`}><button className="collaborator-toggle" aria-expanded={collaboratorsExpanded} aria-controls="collaborator-list" onClick={() => setCollaboratorsExpanded((expanded) => !expanded)}><span>{collaboratorsExpanded ? "Collaborators" : "People"}</span><span>{collaborators.length} <span aria-hidden="true">{collaboratorsExpanded ? "▾" : "▸"}</span></span></button>
+        {collaboratorsExpanded && <div id="collaborator-list">
         {collaborators.map((collaborator) => <div className="collaborator-row" key={collaborator.userId}><i style={{ backgroundColor: collaborator.color }} /><div><strong>{collaborator.username}{collaborator.userId === currentUserId ? " (you)" : ""}</strong><span>{collaborator.filePath ?? "Room"}{collaborator.cursor ? ` · line ${collaborator.cursor.line}` : ""}</span></div></div>)}
         {!collaborators.length && <p className="collaborator-empty">No one else is online.</p>}
         {joinRequests.length > 0 && <div style={{ marginTop: 24 }}>
@@ -688,9 +775,20 @@ export default function App() {
             </div>
           ))}
         </div>}
+        </div>}
       </aside>
       <div className="editor-container"><CodeEditor doc={doc} language={language} remoteCursors={remoteCursors} onCursorMove={updateCursor} /></div>
       <aside className="output-container"><div className="output-title">Output</div><pre>{output || "Run your code to see output here."}</pre></aside>
+      {chatExpanded && <aside className="chat-panel" id="room-chat" aria-label="Room chat">
+        <div className="chat-heading"><div><strong>Room chat</strong><span>{activeFile ? `History for ${activeFile.path}` : "History for this room"}</span></div><button className="secondary" aria-label="Collapse room chat" onClick={() => setChatExpanded(false)}>×</button></div>
+        <div className="chat-messages" aria-live="polite">
+          {chatLoading && <p className="chat-state">Loading messages…</p>}
+          {!chatLoading && chatMessages.length === 0 && <p className="chat-state">No messages yet. Start the conversation.</p>}
+          {chatMessages.map((message) => <article className="chat-message" key={message.id}><div><strong>{message.author.username}</strong><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString()}</time></div><p>{message.content}</p></article>)}
+        </div>
+        {chatError && <p className="chat-error" role="alert">{chatError}</p>}
+        <form className="chat-compose" onSubmit={sendChatMessage}><label className="sr-only" htmlFor="chat-draft">Message</label><textarea id="chat-draft" value={chatDraft} maxLength={2000} rows={2} placeholder="Message this room…" onChange={(event) => setChatDraft(event.target.value)} /><button disabled={!chatDraft.trim() || chatDraft.length > 2000 || status !== "connected"}>Send</button><span>{chatDraft.length}/2000</span></form>
+      </aside>}
     </section>
   </main>
 }
