@@ -280,6 +280,10 @@ Stronger execution isolation
 
 ## 🧪 Verification
 
+### Continuous integration
+
+GitHub Actions runs on pushes to `main` and pull requests targeting `main`. It installs the server and client from their lockfiles, starts a disposable PostgreSQL 16 service with the dedicated `codesync_test` database, applies checked-in Prisma migrations, and runs the full unit and PostgreSQL integration test suite. It also runs server/test typechecks, server and client production builds, and client lint. The CI database is isolated from local development and production settings.
+
 ### Test database setup
 
 The complete test suite resets a **dedicated local PostgreSQL database** before integration tests. It will refuse to reset a database unless its name is exactly `codesync_test` and its host is `localhost`, `127.0.0.1`, or `::1`. Never point this URL at your development or production database.
