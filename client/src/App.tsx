@@ -39,6 +39,7 @@ function decodeBase64(value: string) {
 
 export default function App() {
   const [token, setToken] = useState("")
+  const [isRestoring, setIsRestoring] = useState(true)
   const [currentUserId, setCurrentUserId] = useState("")
   const [username, setUsername] = useState("")
   const [authMode, setAuthMode] = useState<"login" | "signup">("login")
@@ -67,6 +68,29 @@ export default function App() {
   const lastCursorSentAtRef = useRef(0)
   const pendingCursorRef = useRef<{ line: number; column: number } | null>(null)
   const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    const storedToken = localStorage.getItem("token")
+    if (!storedToken) {
+      setIsRestoring(false)
+      return
+    }
+    fetch(`${apiUrl}/auth/me`, { headers: { Authorization: `Bearer ${storedToken}` } })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Invalid session")
+        const data = await response.json()
+        setToken(storedToken)
+        setCurrentUserId(data.user.id)
+        setUsername(data.user.username)
+      })
+      .catch(() => {
+        localStorage.removeItem("token")
+        setToken("")
+      })
+      .finally(() => {
+        setIsRestoring(false)
+      })
+  }, [])
 
   useEffect(() => {
     if (!token) return
@@ -124,6 +148,7 @@ export default function App() {
       const data = await response.json() as AuthResponse
       if (!response.ok) throw new Error(data.error || "Authentication failed.")
       setToken(data.token)
+      localStorage.setItem("token", data.token)
       setCurrentUserId(data.user.id)
       setUsername(data.user.username)
       setAuthPassword("")
@@ -428,6 +453,7 @@ export default function App() {
       setError("Could not reach the server to revoke this session. The local session was cleared; server-side expiry is one hour.")
     } finally {
       setToken("")
+      localStorage.removeItem("token")
       setCurrentUserId("")
       setUsername("")
       setProjects([])
@@ -482,6 +508,10 @@ export default function App() {
       line: collaborator.cursor!.line,
       column: collaborator.cursor!.column,
     }))
+
+  if (isRestoring) {
+    return <main className="join-screen"><div className="logo"><span>Code</span><strong>Sync</strong></div><p className="tagline">Restoring session…</p></main>
+  }
 
   if (!token) {
     return <main className="join-screen">
