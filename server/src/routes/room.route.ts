@@ -1,7 +1,7 @@
 import { Router } from "express"
 import { z } from "zod"
 import { requireAuth } from "../auth/middleware.js"
-import { inviteRoomMember, ensureRoomAccess, createJoinRequest, getRoomJoinRequests, approveRoomJoinRequest, rejectRoomJoinRequest, hasRoomAccess, listRoomChatMessages } from "../auth/roomStore.js"
+import { inviteRoomMember, ensureRoomAccess, createJoinRequest, getRoomJoinRequests, getRoomJoinRequestStatus, approveRoomJoinRequest, rejectRoomJoinRequest, hasRoomAccess, listRoomChatMessages } from "../auth/roomStore.js"
 import { findUserByName, findUserById, wsEvents } from "../auth/store.js"
 import { logWarn } from "../observability/logger.js"
 
@@ -29,6 +29,14 @@ router.post("/:roomId/requests", async (req, res) => {
   if (!request) return res.status(404).json({ error: "Room not found." })
   if (request.created) wsEvents.emit("join-request", request.ownerId, request.type, request.targetId, user.id, user.username)
   res.status(201).json({ status: "pending", created: request.created })
+})
+
+router.get("/:roomId/requests/status", async (req, res) => {
+  const roomId = roomIdSchema.safeParse(req.params.roomId)
+  if (!roomId.success) return res.status(400).json({ error: "Invalid room ID." })
+  const status = await getRoomJoinRequestStatus(roomId.data, res.locals.userId!)
+  if (!status) return res.status(404).json({ error: "Room not found." })
+  res.json(status)
 })
 
 router.get("/:roomId/messages", async (req, res) => {

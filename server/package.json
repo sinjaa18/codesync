@@ -8,7 +8,7 @@
     "dev": "npm run db:generate && node --env-file-if-exists=.env --import tsx --watch src/index.ts",
     "build": "npm run db:generate && tsc",
     "test": "npm run db:generate && npm run test:db:reset && npm run test:typecheck && npm run test:unit && npm run test:integration:run",
-    "test:unit": "node --import tsx --test test/unit/benchmark-safety.test.ts test/unit/execution.test.ts test/unit/observability.test.ts test/unit/test-database-guard.test.ts",
+    "test:unit": "node --import tsx --test test/unit/benchmark-safety.test.ts test/unit/execution.test.ts test/unit/join-request-client.test.ts test/unit/observability.test.ts test/unit/test-database-guard.test.ts",
     "test:integration": "npm run db:generate && npm run test:db:reset && npm run test:integration:run",
     "test:integration:run": "node --env-file-if-exists=.env.test.local --import tsx --test test/integration/collaboration.test.ts",
     "test:db:reset": "node --env-file-if-exists=.env.test.local scripts/reset-test-db.mjs",

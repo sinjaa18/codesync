@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react"
 import * as Y from "yjs"
 import CodeEditor from "./components/CodeEditor"
+import { createApprovalGuard, reconcileJoinRequest } from "./joinRequest"
 
 const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:5000"
 const wsUrl = import.meta.env.VITE_WS_URL || apiUrl.replace(/^http/, "ws")
@@ -70,6 +71,7 @@ export default function App() {
   const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([])
   const [canRequestAccess, setCanRequestAccess] = useState(false)
   const [requestStatus, setRequestStatus] = useState<"idle" | "pending">("idle")
+  const [approvalSignal, setApprovalSignal] = useState(0)
   const [collaboratorsExpanded, setCollaboratorsExpanded] = useState(true)
   const [chatExpanded, setChatExpanded] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
@@ -78,6 +80,10 @@ export default function App() {
   const [chatError, setChatError] = useState("")
   const [deletingProject, setDeletingProject] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
+  const connectRef = useRef<(targetRoom?: string) => Promise<void>>(async () => {})
+  const requestWsRef = useRef<WebSocket | null>(null)
+  const requestSubmitInFlightRef = useRef(false)
+  const approvalGuardRef = useRef(createApprovalGuard())
   const docRef = useRef(doc)
   const activeRoomRef = useRef<string | null>(null)
   const lastCursorRef = useRef("")
@@ -85,6 +91,59 @@ export default function App() {
   const pendingCursorRef = useRef<{ line: number; column: number } | null>(null)
   const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const chatLoadIdRef = useRef(0)
+
+  useEffect(() => {
+    if (requestStatus !== "pending" || !roomId) return
+    let stopped = false
+    let checking = false
+    let consecutiveFailures = 0
+    const checkStatus = async () => {
+      if (stopped || checking || requestSubmitInFlightRef.current) return
+      checking = true
+      try {
+        const outcome = await reconcileJoinRequest(async () => {
+          const response = await fetch(`${apiUrl}/rooms/${encodeURIComponent(roomId)}/requests/status`, { headers: { Authorization: `Bearer ${token}` } })
+          const data = await response.json() as { approved?: boolean; pending?: boolean; error?: string }
+          if (!response.ok || typeof data.approved !== "boolean" || typeof data.pending !== "boolean") throw new Error(data.error || "Could not check join request status.")
+          return { approved: data.approved, pending: data.pending }
+        }, () => {
+          if (stopped) return
+          setRequestStatus("idle")
+          setCanRequestAccess(false)
+          setError("")
+          requestWsRef.current?.close()
+          requestWsRef.current = null
+          approvalGuardRef.current.run(() => { void connectRef.current(roomId) })
+        }, () => {
+          if (stopped) return
+          setRequestStatus("idle")
+          setCanRequestAccess(true)
+          setError("Your request to join was declined.")
+          requestWsRef.current?.close()
+          requestWsRef.current = null
+        })
+        consecutiveFailures = 0
+        if (outcome === "pending") return
+      } catch {
+        consecutiveFailures += 1
+        if (!stopped && consecutiveFailures >= 3) {
+          setRequestStatus("idle")
+          setCanRequestAccess(true)
+          setError("Could not check approval status. You can try again or join the room manually.")
+          requestWsRef.current?.close()
+          requestWsRef.current = null
+        }
+      } finally {
+        checking = false
+      }
+    }
+    void checkStatus()
+    const timer = setInterval(() => { void checkStatus() }, 1500)
+    return () => {
+      stopped = true
+      clearInterval(timer)
+    }
+  }, [approvalSignal, requestStatus, roomId, token])
 
   useEffect(() => {
     const storedToken = localStorage.getItem("token")
@@ -302,6 +361,8 @@ export default function App() {
       return
     }
     const chatLoadId = ++chatLoadIdRef.current
+    requestWsRef.current?.close()
+    requestWsRef.current = null
     const previousSocket = wsRef.current
     wsRef.current = null
     activeRoomRef.current = null
@@ -414,17 +475,10 @@ export default function App() {
         setJoinRequests((prev) => [...prev.filter(r => r.user.id !== reqUser.id), { user: reqUser, targetType, targetId }])
       }
       if (data.type === "request-approved" && data.targetId) {
-        if (!joined && roomId === data.targetId) {
-           connect(data.targetId)
-        } else if (!joined) {
-          setRequestStatus("idle")
-          setCanRequestAccess(false)
-          setError("Your request was approved. Join the room again to continue.")
-        }
+        setApprovalSignal((signal) => signal + 1)
       }
       if (data.type === "request-rejected" && !joined) {
-        setRequestStatus("idle")
-        setError("Your request to join was declined.")
+        setApprovalSignal((signal) => signal + 1)
       }
       if (data.type === "presence-state" && Array.isArray(data.collaborators)) setCollaborators(data.collaborators)
       if (data.type === "presence-update" && data.collaborator) {
@@ -462,6 +516,7 @@ export default function App() {
       setError((current) => current || "Connection closed. Reconnect to continue collaborating.")
     }
   }
+  connectRef.current = connect
 
   const updateCursor = (line: number, column: number) => {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return
@@ -690,17 +745,35 @@ export default function App() {
           </div>
           <details className="legacy-room" open={canRequestAccess}><summary>Join an existing room</summary>
             <form className="create-project" onSubmit={(event) => { event.preventDefault(); setProject(null); connect() }}>
-              <input aria-label="Room ID" autoComplete="off" maxLength={64} placeholder="Enter a room ID" value={roomId} onChange={(event) => setRoomId(event.target.value)} />
+              <input aria-label="Room ID" autoComplete="off" maxLength={64} placeholder="Enter a room ID" value={roomId} disabled={requestStatus === "pending"} onChange={(event) => setRoomId(event.target.value)} />
               <button type="submit" disabled={status === "connecting"}>{status === "connecting" ? "Connecting…" : "Join room"}</button>
               {canRequestAccess && <button type="button" className="secondary" disabled={requestStatus === "pending"} onClick={async () => {
+                requestSubmitInFlightRef.current = true
+                approvalGuardRef.current.reset()
                 setRequestStatus("pending")
                 try {
                   const res = await fetch(`${apiUrl}/rooms/${encodeURIComponent(roomId)}/requests`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
-                  if (!res.ok) throw new Error()
+                  const data = await res.json() as { error?: string }
+                  if (!res.ok) throw new Error(data.error || "Failed to send request.")
                   setError("Request sent. Waiting for approval...")
-                } catch {
-                  setError("Failed to send request.")
+                  const requestWs = new WebSocket(wsUrl)
+                  requestWsRef.current?.close()
+                  requestWsRef.current = requestWs
+                  requestWs.onopen = () => requestWs.send(JSON.stringify({ type: "authenticate", token }))
+                  requestWs.onmessage = (event: MessageEvent<string>) => {
+                    try {
+                      const message = JSON.parse(event.data) as ServerMessage
+                      if (message.type === "request-approved" || message.type === "request-rejected") setApprovalSignal((signal) => signal + 1)
+                    } catch {
+                      // Status polling remains the recovery path if the notification payload is invalid.
+                    }
+                  }
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : "Failed to send request.")
                   setRequestStatus("idle")
+                } finally {
+                  requestSubmitInFlightRef.current = false
+                  setApprovalSignal((signal) => signal + 1)
                 }
               }}>{requestStatus === "pending" ? "Request pending…" : "Request Access"}</button>}
             </form>

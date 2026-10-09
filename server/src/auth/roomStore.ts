@@ -84,6 +84,17 @@ export async function getRoomJoinRequests(roomId: string, ownerId: string) {
   })
 }
 
+export async function getRoomJoinRequestStatus(roomId: string, userId: string) {
+  const room = await prisma.room.findUnique({ where: { id: roomId }, select: { projectId: true } })
+  if (!room) return null
+  const approved = await hasRoomAccess(roomId, userId)
+  if (approved) return { approved: true, pending: false }
+  const pending = room.projectId
+    ? Boolean(await prisma.projectJoinRequest.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }))
+    : Boolean(await prisma.roomJoinRequest.findUnique({ where: { roomId_userId: { roomId, userId } }, select: { userId: true } }))
+  return { approved: false, pending }
+}
+
 export async function approveRoomJoinRequest(roomId: string, ownerId: string, memberId: string) {
   const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true } })
   if (room?.ownerId !== ownerId) return false

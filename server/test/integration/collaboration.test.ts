@@ -613,6 +613,13 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const repeatedRequest = await api(`/rooms/${privateFile.roomId}/requests`, requestAuth.token, {}, "POST")
   assert.equal(repeatedRequest.status, 201)
   assert.equal((await repeatedRequest.json() as { created: boolean }).created, false, "repeated submissions do not create duplicate requests")
+  const pendingJoinStatus = await api(`/rooms/${privateFile.roomId}/requests/status`, requestAuth.token)
+  assert.deepEqual(await pendingJoinStatus.json(), { approved: false, pending: true }, "requester can recover pending state from persisted request data")
+  const requestNotification = new WebSocket(`ws://127.0.0.1:${port}`)
+  await new Promise<void>((resolve, reject) => { requestNotification.once("open", resolve); requestNotification.once("error", reject) })
+  const notificationAuthenticated = nextMessage(requestNotification, "authenticated")
+  requestNotification.send(JSON.stringify({ type: "authenticate", token: requestAuth.token }))
+  await notificationAuthenticated
   const ownerSocketClosed = new Promise<void>((resolve) => unrelatedPeer.peer.ws.once("close", () => resolve()))
   unrelatedPeer.peer.ws.close()
   await ownerSocketClosed
@@ -640,8 +647,14 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
 
   // 4. Request again and approve
   await api(`/rooms/${privateFile.roomId}/requests`, requestAuth.token, {}, "POST")
+  const approvalNotificationPromise = nextMessage(requestNotification, "request-approved")
   const approveRes = await api(`/projects/${privateProject.id}/requests/${requestName}/approve`, outsiderAuth.token, {}, "POST")
   assert.equal(approveRes.status, 204, "owner can approve request")
+  const approvalNotification = await approvalNotificationPromise
+  assert.equal(approvalNotification.targetId, privateProject.id, "approval notification reaches the authenticated requester with its project scope")
+  const approvedJoinStatus = await api(`/rooms/${privateFile.roomId}/requests/status`, requestAuth.token)
+  assert.deepEqual(await approvedJoinStatus.json(), { approved: true, pending: false }, "room membership is the source of truth after approval")
+  requestNotification.close()
   
   // 5. Connect as approved member
   const approvedPeer = await connectPeer(new Y.Doc(), privateFile.roomId, requestAuth.token)
