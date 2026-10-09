@@ -54,6 +54,6 @@ export default function CodeEditor({ doc, language, onCursorMove, remoteCursors 
       const classId = userId.replace(/[^a-z0-9_-]/gi, "_")
       return `.remote-cursor-${classId}::before{content:"";margin-left:-1px;border-left:2px solid ${color}}.remote-cursor-label-${classId}{background:${color};color:#101214;border-radius:2px;margin-left:3px;padding:1px 4px;font-size:11px;font-weight:600}`
     }).join("\n")}</style>
-    <Editor height="100%" language={language} defaultValue="" onMount={handleMount} theme="vs-dark" options={{ minimap: { enabled: false }, fontSize: 14, automaticLayout: true }} />
+    <Editor height="100%" language={language} defaultValue={doc.getText("code").toString()} onMount={handleMount} theme="vs-dark" options={{ minimap: { enabled: false }, fontSize: 14, automaticLayout: true }} />
   </>
 }
