@@ -649,6 +649,7 @@ export default function App() {
       line: collaborator.cursor!.line,
       column: collaborator.cursor!.column,
     }))
+  const hasOtherCollaborators = collaborators.some((collaborator) => collaborator.userId !== currentUserId)
 
   if (isRestoring) {
     return <main className="join-screen"><div className="logo"><span>Code</span><strong>Sync</strong></div><p className="tagline">Restoring session…</p></main>
@@ -761,7 +762,7 @@ export default function App() {
       <aside className={`collaborator-panel${collaboratorsExpanded ? "" : " collapsed"}`}><button className="collaborator-toggle" aria-expanded={collaboratorsExpanded} aria-controls="collaborator-list" onClick={() => setCollaboratorsExpanded((expanded) => !expanded)}><span>{collaboratorsExpanded ? "Collaborators" : "People"}</span><span>{collaborators.length} <span aria-hidden="true">{collaboratorsExpanded ? "▾" : "▸"}</span></span></button>
         {collaboratorsExpanded && <div id="collaborator-list">
         {collaborators.map((collaborator) => <div className="collaborator-row" key={collaborator.userId}><i style={{ backgroundColor: collaborator.color }} /><div><strong>{collaborator.username}{collaborator.userId === currentUserId ? " (you)" : ""}</strong><span>{collaborator.filePath ?? "Room"}{collaborator.cursor ? ` · line ${collaborator.cursor.line}` : ""}</span></div></div>)}
-        {!collaborators.length && <p className="collaborator-empty">No one else is online.</p>}
+        {!hasOtherCollaborators && <p className="collaborator-empty">No one else is online.</p>}
         {joinRequests.length > 0 && <div style={{ marginTop: 24 }}>
           <div className="collaborator-heading">Pending Requests <span>{joinRequests.length}</span></div>
           {joinRequests.map(req => (
