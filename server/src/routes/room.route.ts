@@ -1,8 +1,8 @@
 import { Router } from "express"
 import { z } from "zod"
 import { requireAuth } from "../auth/middleware.js"
-import { inviteRoomMember, ensureRoomAccess } from "../auth/roomStore.js"
-import { findUserByName } from "../auth/store.js"
+import { inviteRoomMember, ensureRoomAccess, createJoinRequest, getRoomJoinRequests, approveRoomJoinRequest, rejectRoomJoinRequest } from "../auth/roomStore.js"
+import { findUserByName, findUserById, wsEvents } from "../auth/store.js"
 import { logWarn } from "../observability/logger.js"
 
 const router = Router()
@@ -18,6 +18,53 @@ router.post("/:roomId/access", async (req, res) => {
     return res.status(403).json({ error: "You do not have access to this room. Ask its owner to invite your username." })
   }
   res.status(access.created ? 201 : 200).json({ roomId: parsed.data })
+})
+
+router.post("/:roomId/requests", async (req, res) => {
+  const roomId = roomIdSchema.safeParse(req.params.roomId)
+  if (!roomId.success) return res.status(400).json({ error: "Invalid room ID." })
+  const user = await findUserById(res.locals.userId!)
+  if (!user) return res.status(404).json({ error: "User not found." })
+  const request = await createJoinRequest(roomId.data, user.id)
+  console.log("REQUEST IS:", request)
+  if (!request) return res.status(404).json({ error: "Room not found." })
+  try {
+    wsEvents.emit("join-request", request.ownerId, request.type, request.targetId, user.id, user.username)
+  } catch (e) {
+    console.error("WSEVENTS ERROR:", e)
+    throw e
+  }
+  res.status(201).json({ status: "pending" })
+})
+
+router.get("/:roomId/requests", async (req, res) => {
+  const roomId = roomIdSchema.safeParse(req.params.roomId)
+  if (!roomId.success) return res.status(400).json({ error: "Invalid room ID." })
+  const requests = await getRoomJoinRequests(roomId.data, res.locals.userId!)
+  res.json(requests)
+})
+
+router.post("/:roomId/requests/:username/approve", async (req, res) => {
+  const roomId = roomIdSchema.safeParse(req.params.roomId)
+  const username = z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_-]+$/).safeParse(req.params.username)
+  if (!roomId.success || !username.success) return res.status(400).json({ error: "Invalid room ID or username." })
+  const user = await findUserByName(username.data)
+  if (!user) return res.status(404).json({ error: "User not found." })
+  const success = await approveRoomJoinRequest(roomId.data, res.locals.userId!, user.id)
+  if (!success) return res.status(403).json({ error: "Could not approve request." })
+  wsEvents.emit("request-approved", user.id, roomId.data)
+  res.status(204).end()
+})
+
+router.delete("/:roomId/requests/:username", async (req, res) => {
+  const roomId = roomIdSchema.safeParse(req.params.roomId)
+  const username = z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_-]+$/).safeParse(req.params.username)
+  if (!roomId.success || !username.success) return res.status(400).json({ error: "Invalid room ID or username." })
+  const user = await findUserByName(username.data)
+  if (!user) return res.status(404).json({ error: "User not found." })
+  const success = await rejectRoomJoinRequest(roomId.data, res.locals.userId!, user.id)
+  if (!success) return res.status(403).json({ error: "Could not reject request." })
+  res.status(204).end()
 })
 
 router.post("/:roomId/invites", async (req, res) => {

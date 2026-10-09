@@ -1,8 +1,8 @@
 import { Router } from "express"
 import { z } from "zod"
 import { prisma } from "../db/client.js"
-import { findUserByName } from "../auth/store.js"
-import { createProject, createProjectFile, getProjectRole, inviteProjectMember, revokeProjectMembership, deleteProject } from "../auth/projectStore.js"
+import { findUserByName, wsEvents } from "../auth/store.js"
+import { createProject, createProjectFile, getProjectRole, inviteProjectMember, revokeProjectMembership, deleteProject, getProjectJoinRequests, approveProjectJoinRequest, rejectProjectJoinRequest } from "../auth/projectStore.js"
 import { requireAuth } from "../auth/middleware.js"
 import { logWarn } from "../observability/logger.js"
 
@@ -105,6 +105,36 @@ router.post("/:projectId/invites", async (req, res) => {
     logWarn("authorization.project_invite_denied", { requestId: res.locals.requestId, userId: res.locals.userId, projectId: projectId.data })
     return res.status(403).json({ error: "Only the project owner can invite participants." })
   }
+  res.status(204).end()
+})
+
+router.get("/:projectId/requests", async (req, res) => {
+  const projectId = projectIdSchema.safeParse(req.params.projectId)
+  if (!projectId.success) return res.status(400).json({ error: "Invalid project ID." })
+  const requests = await getProjectJoinRequests(projectId.data, res.locals.userId!)
+  res.json(requests)
+})
+
+router.post("/:projectId/requests/:username/approve", async (req, res) => {
+  const projectId = projectIdSchema.safeParse(req.params.projectId)
+  const username = z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_-]+$/).safeParse(req.params.username)
+  if (!projectId.success || !username.success) return res.status(400).json({ error: "Invalid project ID or username." })
+  const user = await findUserByName(username.data)
+  if (!user) return res.status(404).json({ error: "User not found." })
+  const success = await approveProjectJoinRequest(projectId.data, res.locals.userId!, user.id)
+  if (!success) return res.status(403).json({ error: "Could not approve request." })
+  wsEvents.emit("request-approved", user.id, projectId.data)
+  res.status(204).end()
+})
+
+router.delete("/:projectId/requests/:username", async (req, res) => {
+  const projectId = projectIdSchema.safeParse(req.params.projectId)
+  const username = z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_-]+$/).safeParse(req.params.username)
+  if (!projectId.success || !username.success) return res.status(400).json({ error: "Invalid project ID or username." })
+  const user = await findUserByName(username.data)
+  if (!user) return res.status(404).json({ error: "User not found." })
+  const success = await rejectProjectJoinRequest(projectId.data, res.locals.userId!, user.id)
+  if (!success) return res.status(403).json({ error: "Could not reject request." })
   res.status(204).end()
 })
 

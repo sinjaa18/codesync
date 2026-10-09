@@ -137,6 +137,24 @@ onProjectDeleted((projectId) => {
   }
 })
 
+import { wsEvents } from "./auth/store.js"
+
+wsEvents.on("join-request", (ownerId: string, targetType: "project" | "room", targetId: string, userId: string, username: string) => {
+  for (const [ws, info] of membership.entries()) {
+    if (info.userId === ownerId) {
+      ws.send(JSON.stringify({ type: "join-request", targetType, targetId, userId, username }))
+    }
+  }
+})
+
+wsEvents.on("request-approved", (userId: string, targetId: string) => {
+  for (const [ws, user] of socketUsers.entries()) {
+    if (user.id === userId) {
+      ws.send(JSON.stringify({ type: "request-approved", targetId }))
+    }
+  }
+})
+
 wss.on("connection", (ws, request) => {
   const connectionId = randomUUID()
   const connectedAt = performance.now()

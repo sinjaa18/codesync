@@ -1,6 +1,9 @@
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto"
 import { promisify } from "node:util"
+import { EventEmitter } from "node:events"
 import { prisma } from "../db/client.js"
+
+export const wsEvents = new EventEmitter()
 
 const scrypt = promisify(scryptCallback)
 const sessionLifetimeMs = 60 * 60 * 1000

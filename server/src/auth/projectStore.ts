@@ -91,3 +91,41 @@ export async function deleteProject(projectId: string, ownerId: string) {
   for (const listener of projectDeletionListeners) listener(projectId)
   return true
 }
+
+export async function getProjectJoinRequests(projectId: string, ownerId: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
+  if (project?.ownerId !== ownerId) {
+    console.log("getProjectJoinRequests MISMATCH", { projectOwnerId: project?.ownerId, ownerId })
+    return []
+  }
+  const requests = await prisma.projectJoinRequest.findMany({
+    where: { projectId },
+    include: { user: { select: { id: true, username: true } } },
+    orderBy: { createdAt: "asc" }
+  })
+  console.log("getProjectJoinRequests RETURNING", requests.length)
+  return requests
+}
+
+export async function approveProjectJoinRequest(projectId: string, ownerId: string, memberId: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
+  if (project?.ownerId !== ownerId) return false
+  const request = await prisma.projectJoinRequest.findUnique({ where: { projectId_userId: { projectId, userId: memberId } } })
+  if (!request) return false
+  await prisma.$transaction([
+    prisma.projectMembership.upsert({
+      where: { projectId_userId: { projectId, userId: memberId } },
+      create: { projectId, userId: memberId, role: "EDITOR" },
+      update: { role: "EDITOR" },
+    }),
+    prisma.projectJoinRequest.delete({ where: { projectId_userId: { projectId, userId: memberId } } })
+  ])
+  return true
+}
+
+export async function rejectProjectJoinRequest(projectId: string, ownerId: string, memberId: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { ownerId: true } })
+  if (project?.ownerId !== ownerId) return false
+  const { count } = await prisma.projectJoinRequest.deleteMany({ where: { projectId, userId: memberId } })
+  return count > 0
+}

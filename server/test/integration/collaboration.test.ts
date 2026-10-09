@@ -115,6 +115,9 @@ async function api(path: string, token?: string, body?: unknown, method?: string
 
 async function signup(username: string) {
   const response = await api("/auth/signup", undefined, { username, password: "test-password-123" })
+  if (response.status !== 201) {
+    console.error("Signup failed:", await response.text())
+  }
   assert.equal(response.status, 201)
   return (await response.json()) as { token: string; user: { id: string; username: string } }
 }
@@ -594,8 +597,44 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   } catch (e) {
     assert.fail("Revoked socket was not forcibly closed by the server")
   }
+  // --- REGRESSION TESTS: Join Requests ---
+  const requestName = `${prefix}req`
+  const requestAuth = await signup(requestName)
   
-  // 4. Project Deletion
+  // 1. Request access
+  const requestAccessRes = await api(`/rooms/${privateFile.roomId}/requests`, requestAuth.token, {}, "POST")
+  if (requestAccessRes.status !== 201) console.error(await requestAccessRes.text())
+  try {
+    assert.equal(requestAccessRes.status, 201, "can request access to a room")
+  } catch (e) {
+    console.log(serverLogs.join(""))
+    throw e
+  }
+
+  // 2. Owner lists requests
+  const listRequestsRes = await api(`/projects/${privateProject.id}/requests`, outsiderAuth.token)
+  assert.equal(listRequestsRes.status, 200, "owner can list requests")
+  const requests = await listRequestsRes.json() as any[]
+  if (requests.length !== 1) console.error("REQUESTS ARE:", requests)
+  assert.equal(requests.length, 1, "join request is listed")
+  assert.equal(requests[0].user.username, requestName, "requester username matches")
+
+  // 3. Reject access
+  const rejectRes = await api(`/projects/${privateProject.id}/requests/${requestName}`, outsiderAuth.token, undefined, "DELETE")
+  assert.equal(rejectRes.status, 204, "owner can reject request")
+  
+
+  // 4. Request again and approve
+  await api(`/rooms/${privateFile.roomId}/requests`, requestAuth.token, {}, "POST")
+  const approveRes = await api(`/projects/${privateProject.id}/requests/${requestName}/approve`, outsiderAuth.token, {}, "POST")
+  assert.equal(approveRes.status, 204, "owner can approve request")
+  
+  // 5. Connect as approved member
+  const approvedPeer = await connectPeer(new Y.Doc(), privateFile.roomId, requestAuth.token)
+  peers.push(approvedPeer.peer)
+  assert.equal(approvedPeer.peer.ws.readyState, WebSocket.OPEN, "approved user can connect to the room")
+
+  // 6. Project Deletion
   const ownerClosedPromise = new Promise<void>((resolve) => unrelatedPeer.peer.ws.readyState === WebSocket.CLOSED ? resolve() : unrelatedPeer.peer.ws.once("close", () => resolve()))
   const deleteResponse = await api(`/projects/${privateProject.id}`, outsiderAuth.token, undefined, "DELETE")
   assert.equal(deleteResponse.status, 204, "owner can delete project")

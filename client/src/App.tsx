@@ -18,11 +18,15 @@ type ServerMessage = {
   collaborator?: Collaborator
   collaborators?: Collaborator[]
   user?: { id: string; username: string }
+  targetId?: string
+  targetType?: string
+  username?: string
 }
 type AuthResponse = { token: string; user: { id: string; username: string }; error?: string }
 type Collaborator = { userId: string; username: string; color: string; projectId: string | null; fileId: string | null; filePath: string | null; cursor: { line: number; column: number } | null; online: boolean }
 type Project = { id: string; name: string; role: string }
 type WorkspaceFile = { id: string; projectId: string; path: string; content: string; roomId: string | null }
+type JoinRequest = { user: { id: string; username: string }; targetType: "project" | "room"; targetId: string }
 
 function encodeBase64(bytes: Uint8Array) {
   let binary = ""
@@ -61,6 +65,9 @@ export default function App() {
   const [files, setFiles] = useState<WorkspaceFile[]>([])
   const [activeFile, setActiveFile] = useState<WorkspaceFile | null>(null)
   const [projectName, setProjectName] = useState("")
+  const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([])
+  const [canRequestAccess, setCanRequestAccess] = useState(false)
+  const [requestStatus, setRequestStatus] = useState<"idle" | "pending">("idle")
   const wsRef = useRef<WebSocket | null>(null)
   const docRef = useRef(doc)
   const activeRoomRef = useRef<string | null>(null)
@@ -168,6 +175,15 @@ export default function App() {
       setProject(selected)
       setFiles(data)
       setActiveFile(null)
+      if (selected.role === "OWNER") {
+        fetch(`${apiUrl}/projects/${encodeURIComponent(selected.id)}/requests`, { headers: { Authorization: `Bearer ${token}` } })
+          .then((res) => res.ok ? res.json() : [])
+          .then((reqs) => {
+             if (Array.isArray(reqs)) setJoinRequests(reqs.map(d => ({ user: d.user, targetType: "project", targetId: selected.id })))
+          }).catch(() => {})
+      } else {
+        setJoinRequests([])
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load project files.")
     }
@@ -287,13 +303,18 @@ export default function App() {
     setCollaborators([])
     setError("")
     setStatus("connecting")
+    setCanRequestAccess(false)
+    setRequestStatus("idle")
     try {
       const access = await fetch(`${apiUrl}/rooms/${encodeURIComponent(normalizedRoom)}/access`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       })
       const accessData = await access.json() as { error?: string }
-      if (!access.ok) throw new Error(accessData.error || `Could not access room (HTTP ${access.status}).`)
+      if (!access.ok) {
+        if (access.status === 403) setCanRequestAccess(true)
+        throw new Error(accessData.error || `Could not access room (HTTP ${access.status}).`)
+      }
     } catch (err) {
       setStatus("disconnected")
       setError(err instanceof Error ? err.message : "Could not access room.")
@@ -346,7 +367,23 @@ export default function App() {
         setStatus("connected")
         setJoined(true)
         lastCursorRef.current = ""
+        fetch(`${apiUrl}/rooms/${encodeURIComponent(normalizedRoom)}/requests`, { headers: { Authorization: `Bearer ${token}` } })
+          .then((res) => res.ok ? res.json() : [])
+          .then((reqs) => {
+             if (Array.isArray(reqs)) setJoinRequests(reqs.map(d => ({ user: d.user, targetType: "room", targetId: normalizedRoom })))
+          }).catch(() => {})
         return
+      }
+      if (data.type === "join-request" && data.userId && data.username && data.targetId && data.targetType) {
+        const reqUser = { id: data.userId, username: data.username }
+        const targetType = data.targetType as "project" | "room"
+        const targetId = data.targetId
+        setJoinRequests((prev) => [...prev.filter(r => r.user.id !== reqUser.id), { user: reqUser, targetType, targetId }])
+      }
+      if (data.type === "request-approved" && data.targetId) {
+        if (!joined && roomId === data.targetId) {
+           connect(data.targetId)
+        }
       }
       if (data.type === "presence-state" && Array.isArray(data.collaborators)) setCollaborators(data.collaborators)
       if (data.type === "presence-update" && data.collaborator) {
@@ -499,6 +536,24 @@ export default function App() {
     }
   }
 
+  const approveRequest = async (req: JoinRequest) => {
+    try {
+      await fetch(`${apiUrl}/${req.targetType}s/${encodeURIComponent(req.targetId)}/requests/${encodeURIComponent(req.user.username)}/approve`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
+      setJoinRequests(prev => prev.filter(r => r.user.id !== req.user.id))
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
+  const rejectRequest = async (req: JoinRequest) => {
+    try {
+      await fetch(`${apiUrl}/${req.targetType}s/${encodeURIComponent(req.targetId)}/requests/${encodeURIComponent(req.user.username)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } })
+      setJoinRequests(prev => prev.filter(r => r.user.id !== req.user.id))
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
   const remoteCursors = collaborators
     .filter((collaborator) => collaborator.userId !== currentUserId && collaborator.fileId === (activeFile?.id ?? null) && collaborator.cursor)
     .map((collaborator) => ({
@@ -546,10 +601,21 @@ export default function App() {
             {projects.map((item) => <button className="project-card" key={item.id} onClick={() => loadProject(item)}><strong>{item.name}</strong><span>{item.role.toLowerCase()}</span></button>)}
             {!projects.length && <p className="tagline">No projects yet. Create one to start a multi-file workspace.</p>}
           </div>
-          <details className="legacy-room"><summary>Join an existing room</summary>
+          <details className="legacy-room" open={canRequestAccess}><summary>Join an existing room</summary>
             <form className="create-project" onSubmit={(event) => { event.preventDefault(); setProject(null); connect() }}>
               <input aria-label="Room ID" autoComplete="off" maxLength={64} placeholder="Enter a room ID" value={roomId} onChange={(event) => setRoomId(event.target.value)} />
               <button type="submit" disabled={status === "connecting"}>{status === "connecting" ? "Connecting…" : "Join room"}</button>
+              {canRequestAccess && <button type="button" className="secondary" disabled={requestStatus === "pending"} onClick={async () => {
+                setRequestStatus("pending")
+                try {
+                  const res = await fetch(`${apiUrl}/rooms/${encodeURIComponent(roomId)}/requests`, { method: "POST", headers: { Authorization: `Bearer ${token}` } })
+                  if (!res.ok) throw new Error()
+                  setError("Request sent. Waiting for approval...")
+                } catch {
+                  setError("Failed to send request.")
+                  setRequestStatus("idle")
+                }
+              }}>{requestStatus === "pending" ? "Request pending…" : "Request Access"}</button>}
             </form>
           </details>
         </> : <>
@@ -563,6 +629,18 @@ export default function App() {
             {!files.length && <li className="tagline">This project has no files.</li>}
           </ul>
           {activeFile && <button className="open-workspace" onClick={() => openFile(activeFile)}>Open {activeFile.path}</button>}
+          {joinRequests.length > 0 && <div className="join-requests" style={{ marginTop: 24, padding: 16, backgroundColor: "var(--surface)", borderRadius: 8 }}>
+            <h3 style={{ margin: "0 0 12px", fontSize: 14 }}>Pending Join Requests</h3>
+            <ul style={{ padding: 0, margin: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
+              {joinRequests.map(req => (
+                <li key={req.user.id} style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 13 }}>
+                  <strong style={{ flex: 1 }}>{req.user.username}</strong>
+                  <button className="secondary" style={{ padding: "4px 8px", fontSize: 12 }} onClick={() => approveRequest(req)}>Approve</button>
+                  <button className="secondary" style={{ padding: "4px 8px", fontSize: 12 }} onClick={() => rejectRequest(req)}>Reject</button>
+                </li>
+              ))}
+            </ul>
+          </div>}
         </>}
         {error && <p className="error" role="alert">{error}</p>}
       </section>
@@ -595,6 +673,19 @@ export default function App() {
       <aside className="collaborator-panel"><div className="collaborator-heading">Collaborators <span>{collaborators.length}</span></div>
         {collaborators.map((collaborator) => <div className="collaborator-row" key={collaborator.userId}><i style={{ backgroundColor: collaborator.color }} /><div><strong>{collaborator.username}{collaborator.userId === currentUserId ? " (you)" : ""}</strong><span>{collaborator.filePath ?? "Room"}{collaborator.cursor ? ` · line ${collaborator.cursor.line}` : ""}</span></div></div>)}
         {!collaborators.length && <p className="collaborator-empty">No one else is online.</p>}
+        {joinRequests.length > 0 && <div style={{ marginTop: 24 }}>
+          <div className="collaborator-heading">Pending Requests <span>{joinRequests.length}</span></div>
+          {joinRequests.map(req => (
+            <div className="collaborator-row" key={req.user.id}>
+              <div><strong style={{ display: "block", marginBottom: 4 }}>{req.user.username}</strong>
+              <div style={{ display: "flex", gap: 4 }}>
+                <button className="secondary" style={{ padding: "2px 6px", fontSize: 11 }} onClick={() => approveRequest(req)}>Approve</button>
+                <button className="secondary" style={{ padding: "2px 6px", fontSize: 11 }} onClick={() => rejectRequest(req)}>Reject</button>
+              </div>
+              </div>
+            </div>
+          ))}
+        </div>}
       </aside>
       <div className="editor-container"><CodeEditor doc={doc} language={language} remoteCursors={remoteCursors} onCursorMove={updateCursor} /></div>
       <aside className="output-container"><div className="output-title">Output</div><pre>{output || "Run your code to see output here."}</pre></aside>

@@ -58,7 +58,67 @@ export async function hasRoomAccess(roomId: string, userId: string) {
   if (membership) return true
   const room = await prisma.room.findUnique({ where: { id: roomId }, select: { projectId: true } })
   if (!room?.projectId) return false
-  return Boolean(await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { userId: true } }))
+  const projectMember = await prisma.projectMembership.findUnique({ where: { projectId_userId: { projectId: room.projectId, userId } }, select: { role: true } })
+  return projectMember?.role === "OWNER" || projectMember?.role === "EDITOR"
+}
+
+export async function createJoinRequest(roomId: string, userId: string) {
+  const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true, projectId: true } })
+  if (!room) return null
+  try {
+    if (room.projectId) {
+      await prisma.projectJoinRequest.upsert({
+        where: { projectId_userId: { projectId: room.projectId, userId } },
+        create: { projectId: room.projectId, userId },
+        update: {},
+      })
+      const project = await prisma.project.findUnique({ where: { id: room.projectId }, select: { ownerId: true } })
+      return { type: "project" as const, targetId: room.projectId, ownerId: project?.ownerId ?? room.ownerId }
+    } else {
+      await prisma.roomJoinRequest.upsert({
+        where: { roomId_userId: { roomId, userId } },
+        create: { roomId, userId },
+        update: {},
+      })
+      return { type: "room" as const, targetId: roomId, ownerId: room.ownerId }
+    }
+  } catch (error) {
+    console.error("createJoinRequest ERROR:", error)
+    return null
+  }
+}
+
+export async function getRoomJoinRequests(roomId: string, ownerId: string) {
+  const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true } })
+  if (room?.ownerId !== ownerId) return []
+  return prisma.roomJoinRequest.findMany({
+    where: { roomId },
+    include: { user: { select: { id: true, username: true } } },
+    orderBy: { createdAt: "asc" }
+  })
+}
+
+export async function approveRoomJoinRequest(roomId: string, ownerId: string, memberId: string) {
+  const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true } })
+  if (room?.ownerId !== ownerId) return false
+  const request = await prisma.roomJoinRequest.findUnique({ where: { roomId_userId: { roomId, userId: memberId } } })
+  if (!request) return false
+  await prisma.$transaction([
+    prisma.roomMembership.upsert({
+      where: { roomId_userId: { roomId, userId: memberId } },
+      create: { roomId, userId: memberId, role: "MEMBER" },
+      update: { role: "MEMBER" },
+    }),
+    prisma.roomJoinRequest.delete({ where: { roomId_userId: { roomId, userId: memberId } } })
+  ])
+  return true
+}
+
+export async function rejectRoomJoinRequest(roomId: string, ownerId: string, memberId: string) {
+  const room = await prisma.room.findUnique({ where: { id: roomId }, select: { ownerId: true } })
+  if (room?.ownerId !== ownerId) return false
+  const { count } = await prisma.roomJoinRequest.deleteMany({ where: { roomId, userId: memberId } })
+  return count > 0
 }
 
 export async function getRoomPresenceContext(roomId: string) {
