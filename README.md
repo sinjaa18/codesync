@@ -349,6 +349,63 @@ The production frontend is deployed on Vercel and the backend on Render. The aut
 
 ---
 
+## 📊 Performance Benchmark
+
+CodeSync includes a comprehensive local performance benchmark to measure HTTP throughput, WebSocket connection latency, PostgreSQL persistence, and collaborative CRDT (Yjs) propagation times.
+
+### Running the Benchmark
+
+The benchmark is strictly opt-in and designed to run only against a local test environment.
+
+```bash
+cd server
+npm run benchmark -- --allow-local-target --max-clients 25 --requests 30 --repetitions 3
+```
+
+### Safety Requirements
+
+To prevent accidental load against production or development environments, the benchmark enforces several strict safety requirements:
+- **Opt-in Flag**: Requires the `--allow-local-target` argument.
+- **Database Restrictions**: The `DATABASE_URL` must point to `localhost` or `127.0.0.1` and target a database named exactly `codesync_test`.
+- **No Resets**: The benchmark creates unique temporary users, projects, and files for its run, and cleans them up at the end. It **never resets or drops** the database.
+- **No Public Judge0**: It does not perform public Judge0 execution requests.
+
+### Scenarios and Methodology
+
+The harness tests the system across several dimensions:
+1. **HTTP Baseline**: Concurrency tests against `/projects` and `/projects/:projectId/files` endpoints.
+2. **PostgreSQL Persistence**: Measures the latency of the direct `persistRoomUpdate` transaction.
+3. **WebSocket Connections**: Measures connection establishment, authentication, and room join latencies.
+4. **Collaborative Editing (Yjs)**: Measures end-to-end client-to-peer delivery time for Yjs document updates. This is not just server processing time; it includes the network send, server-side persistence in PostgreSQL, and WebSocket broadcast to peers.
+5. **Presence**: Measures the delivery latency of cursor movement broadcasts.
+
+The benchmark tracks p50, p95, and (where sample size permits) p99 latencies, using a monotonic high-resolution clock (`performance.now()`). System-wide CPU and memory are sampled periodically, and execution aborts early if resources run low or error thresholds are crossed.
+
+### Environment and Parameters
+
+The recorded baseline (`docs/performance-baseline.json`) was generated in the following environment:
+- **OS**: Windows 11 (Windows_NT 10.0.26200 x64)
+- **Node.js**: v22.18.0
+- **PostgreSQL**: 18.6
+- **CPU**: AMD Ryzen 7 7730U (8 cores / 16 logical processors)
+- **Memory**: ~14.8 GB
+
+**Parameters used:** Up to 25 clients, 30 requests per repetition, 3 repetitions.
+
+### Measured Findings and Limitations
+
+- **HTTP Concurrency**: At 25 concurrent clients, the server handled ~680 requests/second with a p50 latency under 30ms and a p95 latency under 45ms for authorized list endpoints.
+- **WebSocket Setup**: Establishing 25 connections in parallel succeeded without failures; p50 room join times were typically under 20ms.
+- **Presence**: Cursor position updates broadcast to 5 clients had a p50 delivery time of ~1.3ms.
+- **Collaboration**: Yjs client-to-peer delivery (including persistence) maintained convergence without missed messages.
+- **Limitations**: This is a local test loopback baseline, not a distributed production capacity claim. Network latency is negligible in this test, and the single-instance backend architecture remains the scale bottleneck.
+
+### Concurrent Room-Join Fix
+
+During the development of the benchmark, a concurrent WebSocket room-join race condition was identified. The room's active socket set was looked up before an asynchronous `getRoomDoc` call, meaning simultaneous joins could overwrite each other's room membership, causing missed Yjs updates. The lookup was moved to after the `await`, and a regression integration test (`simultaneous-room-join`) was added to `server/test/integration/collaboration.test.ts` to ensure this condition is isolated and correctly handled. (No before/after load metrics are presented, as the pre-fix state resulted in test failures rather than slower performance).
+
+---
+
 ## 🛠️ Tech Stack
 
 ### Frontend

@@ -222,9 +222,9 @@ wss.on("connection", (ws, request) => {
         previousUserSocket.close(1000, "Presence moved to another connection")
       }
       leaveRoom(ws)
-      const room = rooms.get(roomId) ?? new Set<WebSocket>()
       stage = "document_load"
       const doc = await getRoomDoc(roomId)
+      const room = rooms.get(roomId) ?? new Set<WebSocket>()
       room.add(ws)
       rooms.set(roomId, room)
       roomDocs.set(roomId, doc)
@@ -362,7 +362,7 @@ app.use(errorHandler)
 
 try {
   await prisma.$connect()
-  server.listen(port, () => logInfo("server.started", { port }))
+  server.listen(port, process.env.HOST, () => logInfo("server.started", { port }))
 } catch (error) {
   logError("database.startup_failed", { dependency: "postgresql", ...safeErrorFields(error) })
   process.exitCode = 1

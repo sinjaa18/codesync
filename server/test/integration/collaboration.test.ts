@@ -438,6 +438,21 @@ test("PostgreSQL auth and room data persist while Yjs collaboration converges", 
   const thirdFileResponse = await api(`/projects/${project.id}/files`, ownerToken, { path: "src/third.ts" })
   assert.equal(thirdFileResponse.status, 201)
   const thirdFile = await thirdFileResponse.json() as { id: string; path: string; roomId: string }
+  const [concurrentOwnerPeer, concurrentGuestPeer] = await Promise.all([
+    connectPeer(new Y.Doc(), thirdFile.roomId, ownerToken),
+    connectPeer(new Y.Doc(), thirdFile.roomId, guestAuth.token),
+  ])
+  peers.push(concurrentOwnerPeer.peer, concurrentGuestPeer.peer)
+  concurrentOwnerPeer.peer.doc.getText("code").insert(0, "simultaneous-room-join")
+  await waitFor(() => concurrentGuestPeer.peer.doc.getText("code").toString() === "simultaneous-room-join")
+  assert.equal(concurrentOwnerPeer.peer.doc.getText("code").toString(), concurrentGuestPeer.peer.doc.getText("code").toString(), "concurrent joins preserve room membership and Yjs delivery")
+  for (const concurrentPeer of [concurrentOwnerPeer.peer, concurrentGuestPeer.peer]) {
+    const closed = new Promise<void>((resolve) => concurrentPeer.ws.once("close", () => resolve()))
+    concurrentPeer.ws.close()
+    await closed
+    peers.splice(peers.indexOf(concurrentPeer), 1)
+    concurrentPeer.doc.destroy()
+  }
   assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "../secrets.txt" })).status, 400, "file paths reject traversal")
   assert.equal((await api(`/projects/${project.id}/files`, ownerToken, { path: "src/main.ts" })).status, 409, "duplicate file paths are rejected")
   const guestProjectPeer = await connectPeer(new Y.Doc(), file.roomId, guestAuth.token)
